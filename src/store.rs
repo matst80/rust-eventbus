@@ -16,6 +16,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("Serialization error: {0}")]
     Serialization(#[from] bincode::Error),
+    #[error("Concurrency conflict: {0}")]
+    Conflict(String),
     #[error("Other error: {0}")]
     Other(String),
 }

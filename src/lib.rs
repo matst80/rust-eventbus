@@ -6,6 +6,7 @@ pub mod bus;
 pub mod event;
 pub mod projection;
 pub mod store;
+pub mod distributed;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
