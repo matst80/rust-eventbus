@@ -13,7 +13,8 @@ fn main() {
 async fn main() {
     use std::sync::Arc;
     use rust_eventbus::event::{Event, EventPayload};
-    use rust_eventbus::distributed::BackendPubSub;
+    use rust_eventbus::distributed::{BackendPubSub, DistributedPubSub};
+    use futures::StreamExt;
     use rust_eventbus::libp2p_adapter::Libp2pAdapter;
 
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -33,7 +34,7 @@ async fn main() {
     let backend_pub = BackendPubSub::new(backend, "rust-eventbus-topic".to_string());
 
     // Subscribe and print incoming events
-    let mut sub = backend_pub.subscribe::<DemoPayload>().await;
+    let mut sub = <BackendPubSub as DistributedPubSub<DemoPayload>>::subscribe(&backend_pub).await;
     tokio::spawn(async move {
         while let Some(res) = sub.next().await {
             match res {
@@ -46,7 +47,7 @@ async fn main() {
     // Publish a test event
     let payload = DemoPayload { msg: "hello from libp2p demo".into() };
     let event = Event::new("demo-agg", 1, payload.clone());
-    backend_pub.publish(&event).await.expect("publish");
+    <BackendPubSub as DistributedPubSub<DemoPayload>>::publish(&backend_pub, &event).await.expect("publish");
 
     // Keep the program alive briefly to allow message propagation
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;

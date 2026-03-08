@@ -54,7 +54,7 @@ impl BackendPubSub {
 /// Factory that returns the default mesh implementation as a trait object.
 /// By default this returns the `TcpPubSub` implementation. Enabling the
 /// `libp2p-backend` feature will switch to the libp2p adapter if available.
-pub fn default_mesh<E>(
+pub async fn default_mesh<E>(
     node_id: Uuid,
     listen_addr: String,
     advertised_addr: String,
@@ -66,13 +66,19 @@ where
     #[cfg(feature = "libp2p-backend")]
     {
         // When the feature is enabled we prefer the libp2p adapter. The adapter
-        // is expected to implement `DistributedPubSub<E>`.
-        return std::sync::Arc::new(crate::libp2p_adapter::Libp2pAdapter::new_with_addrs(
+        // is expected to implement `DistributedPubSub<E>` and currently provides
+        // an async constructor.
+        if let Ok(adapter) = crate::libp2p_adapter::Libp2pAdapter::new_with_addrs(
             node_id,
-            listen_addr,
-            advertised_addr,
-            discovery,
-        ));
+            listen_addr.clone(),
+            advertised_addr.clone(),
+            discovery.clone(),
+        )
+        .await
+        {
+            let backend_arc: std::sync::Arc<dyn PubSubBackend> = adapter;
+            return std::sync::Arc::new(BackendPubSub::new(backend_arc, "eventbus".to_string()));
+        }
     }
 
     // Default: TcpPubSub

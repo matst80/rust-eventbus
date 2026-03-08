@@ -209,7 +209,8 @@ pub async fn init_cluster<
         mesh_bind_addr.clone(),
         mesh_advertised_addr.clone(),
         peer_discovery.clone(),
-    );
+    )
+    .await;
 
     let lock_dir = format!("{}/locks", data_dir);
     let lock_manager = Arc::new(FileLeaseLockManager::new(

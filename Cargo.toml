@@ -36,9 +36,13 @@ features = ["gossipsub", "tcp", "noise", "yamux", "tokio", "mdns", "macros"]
 version = "0.49"
 optional = true
 
+[dependencies.libp2p-mdns]
+version = "0.47"
+optional = true
+
 [features]
 # Optional backends
-libp2p-backend = ["libp2p", "libp2p-gossipsub"]
+libp2p-backend = ["libp2p", "libp2p-gossipsub", "libp2p-mdns"]
 
 [dev-dependencies]
 tokio-test = "0.4"
