@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -9,6 +9,66 @@ use uuid::Uuid;
 
 use crate::event::{Event, EventPayload};
 use crate::store::{EventStore, StoreError};
+
+// Bytes-oriented backend trait and codec helpers allow pluggable transports
+// (libp2p, nats, tcp, etc.) to be implemented once and wired into the
+// higher-level `DistributedPubSub<E>` adapter that works with typed `Event<E>`.
+/// A minimal backend trait that operates on raw message bytes.
+/// Implementations can map topics/subjects as-needed for the transport.
+#[async_trait]
+pub trait PubSubBackend: Send + Sync + 'static {
+    /// Publish a raw payload to the given topic/subject.
+    async fn publish_bytes(&self, topic: &str, payload: Vec<u8>) -> Result<(), DistributedError>;
+
+    /// Subscribe to a topic/subject and receive raw payloads as a stream.
+    /// Implementations should return a 'static boxed stream of payloads.
+    fn subscribe_bytes(&self, topic: &str) -> BoxStream<'static, Result<Vec<u8>, DistributedError>>;
+}
+
+/// Helper for encoding/decoding `Event<E>` to/from bytes for wire transport.
+pub struct EventCodec;
+
+impl EventCodec {
+    pub fn encode<E: serde::Serialize + for<'de> serde::Deserialize<'de>>(event: &Event<E>) -> Result<Vec<u8>, DistributedError> {
+        bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))
+    }
+
+    pub fn decode<E: for<'de> serde::Deserialize<'de> + serde::Serialize>(bytes: &[u8]) -> Result<Event<E>, DistributedError> {
+        bincode::deserialize(bytes).map_err(|e| DistributedError::Network(e.to_string()))
+    }
+}
+
+/// Adapter that implements the typed `DistributedPubSub<E>` by delegating to
+/// a bytes-oriented `PubSubBackend` and using `EventCodec` for (de)serialization.
+pub struct BackendPubSub {
+    backend: std::sync::Arc<dyn PubSubBackend>,
+    topic: String,
+}
+
+impl BackendPubSub {
+    pub fn new(backend: std::sync::Arc<dyn PubSubBackend>, topic: String) -> Self {
+        Self { backend, topic }
+    }
+}
+
+#[async_trait]
+impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E>
+    for BackendPubSub
+{
+    async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
+        let bytes = EventCodec::encode(event)?;
+        self.backend.publish_bytes(&self.topic, bytes).await
+    }
+
+    async fn subscribe(&self) -> BoxStream<'static, Result<Event<E>, DistributedError>> {
+        let stream = self.backend.subscribe_bytes(&self.topic);
+        let mapped = stream.map(|res| match res {
+            Ok(bytes) => EventCodec::decode::<E>(&bytes),
+            Err(e) => Err(e),
+        });
+        Box::pin(mapped)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DistributedError {
@@ -237,6 +297,190 @@ fn same_endpoint(a: &str, b: &str) -> bool {
     ) {
         (Ok(lhs), Ok(rhs)) => lhs.ip() == rhs.ip() && lhs.port() == rhs.port(),
         _ => false,
+    }
+}
+
+/// TCP-based bytes-oriented PubSub backend. Mirrors the existing `TcpPubSub`
+/// framing (4-byte length prefix, 16-byte sender UUID, then payload bytes).
+pub struct TcpPubSubBackend {
+    node_id: Uuid,
+    listen_addr: String,
+    advertised_addr: String,
+    discovery: Arc<dyn NodeDiscovery>,
+    discovery_cache: Arc<parking_lot::Mutex<(std::time::Instant, Vec<Node>)>>,
+    connections: Arc<Mutex<HashMap<String, tokio::net::TcpStream>>>,
+}
+
+impl TcpPubSubBackend {
+    pub fn new(node_id: Uuid, listen_addr: String, discovery: Arc<dyn NodeDiscovery>) -> Self {
+        Self::new_with_advertised_addr(node_id, listen_addr.clone(), listen_addr, discovery)
+    }
+
+    pub fn new_with_advertised_addr(
+        node_id: Uuid,
+        listen_addr: String,
+        advertised_addr: String,
+        discovery: Arc<dyn NodeDiscovery>,
+    ) -> Self {
+        Self {
+            node_id,
+            listen_addr,
+            advertised_addr,
+            discovery,
+            discovery_cache: Arc::new(parking_lot::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(60),
+                vec![],
+            ))),
+            connections: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl PubSubBackend for TcpPubSubBackend {
+    async fn publish_bytes(&self, _topic: &str, payload: Vec<u8>) -> Result<(), DistributedError> {
+        let nodes = {
+            let cache = self.discovery_cache.lock();
+            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
+                Some(cache.1.clone())
+            } else {
+                None
+            }
+        };
+
+        let nodes = if let Some(n) = nodes {
+            n
+        } else {
+            let n = self.discovery.discover_nodes().await?;
+            let mut cache = self.discovery_cache.lock();
+            *cache = (std::time::Instant::now(), n.clone());
+            n
+        };
+
+        let my_addr = self.advertised_addr.clone();
+
+        let event_payload = payload;
+        let my_node_id = self.node_id;
+
+        let mut full_payload = Vec::with_capacity(16 + event_payload.len() + 4);
+        let total_len = (16 + event_payload.len()) as u32;
+        full_payload.extend_from_slice(&total_len.to_be_bytes());
+        full_payload.extend_from_slice(my_node_id.as_bytes());
+        full_payload.extend_from_slice(&event_payload);
+
+        let payload_arc = Arc::new(full_payload);
+        let conns_ref = self.connections.clone();
+
+        for node in nodes {
+            if same_endpoint(&node.address, &my_addr) {
+                continue;
+            }
+
+            let addr = node.address.clone();
+            let payload = payload_arc.clone();
+            let conns = conns_ref.clone();
+
+            tokio::spawn(async move {
+                let stream = {
+                    let mut c = conns.lock().await;
+                    c.remove(&addr)
+                };
+
+                let mut send_success = false;
+
+                if let Some(mut s) = stream {
+                    if s.write_all(&payload).await.is_ok() {
+                        let mut c = conns.lock().await;
+                        c.insert(addr.clone(), s);
+                        send_success = true;
+                    }
+                }
+
+                if !send_success {
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+                        Ok(Ok(mut s)) => {
+                            let _ = s.set_nodelay(true);
+                            if s.write_all(&payload).await.is_ok() {
+                                let mut c = conns.lock().await;
+                                c.insert(addr, s);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            tokio::task::yield_now().await;
+        }
+
+        Ok(())
+    }
+
+    fn subscribe_bytes(&self, _topic: &str) -> BoxStream<'static, Result<Vec<u8>, DistributedError>> {
+        let addr = self.listen_addr.clone();
+        let my_node_id = self.node_id;
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind tcp backend listener {}: {}", addr, e);
+                    return;
+                }
+            };
+
+            loop {
+                match listener.accept().await {
+                    Ok((mut socket, peer_addr)) => {
+                        let tx = tx.clone();
+                        let my_node_id = my_node_id;
+                        tokio::spawn(async move {
+                            let mut len_buf = [0u8; 4];
+                            use tokio::io::AsyncReadExt;
+
+                            loop {
+                                match socket.read_exact(&mut len_buf).await {
+                                    Ok(_) => {
+                                        let body_len = u32::from_be_bytes(len_buf) as usize;
+                                        if body_len > 10 * 1024 * 1024 {
+                                            break;
+                                        }
+
+                                        let mut body = vec![0u8; body_len];
+                                        if let Err(_) = socket.read_exact(&mut body).await {
+                                            break;
+                                        }
+
+                                        if body.len() < 16 {
+                                            continue;
+                                        }
+
+                                        let mut id_bytes = [0u8; 16];
+                                        id_bytes.copy_from_slice(&body[..16]);
+                                        let sender_id = Uuid::from_bytes(id_bytes);
+
+                                        if sender_id == my_node_id {
+                                            continue;
+                                        }
+
+                                        let payload = body[16..].to_vec();
+                                        let _ = tx.send(Ok(payload)).await;
+                                    }
+                                    Err(_) => break,
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("accept error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
 

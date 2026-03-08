@@ -8,6 +8,7 @@ pub mod cluster;
 pub mod event;
 pub mod projection;
 pub mod store;
+pub mod libp2p_adapter;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
