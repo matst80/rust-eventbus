@@ -9,6 +9,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -129,23 +130,143 @@ impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
 
 // 4. Distributed Implementations
 
-pub struct MockLockManager;
+pub struct FileLeaseLockManager {
+    lock_dir: String,
+    lease_ttl: std::time::Duration,
+}
+
+impl FileLeaseLockManager {
+    pub fn new(lock_dir: String, lease_ttl: std::time::Duration) -> Self {
+        Self {
+            lock_dir,
+            lease_ttl,
+        }
+    }
+
+    fn lock_path(&self, projection_name: &str) -> String {
+        format!("{}/{}.lock", self.lock_dir, projection_name)
+    }
+
+    async fn read_owner(&self, lock_path: &str) -> Result<Option<Uuid>, LockError> {
+        match tokio::fs::read_to_string(lock_path).await {
+            Ok(content) => Ok(Uuid::parse_str(content.trim()).ok()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LockError::Storage(e.to_string())),
+        }
+    }
+
+    async fn is_stale(&self, lock_path: &str) -> Result<bool, LockError> {
+        match tokio::fs::metadata(lock_path).await {
+            Ok(meta) => {
+                let modified = meta
+                    .modified()
+                    .map_err(|e| LockError::Storage(e.to_string()))?;
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                Ok(age > self.lease_ttl)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(LockError::Storage(e.to_string())),
+        }
+    }
+
+    async fn write_owner(&self, lock_path: &str, node_id: &Uuid) -> Result<(), LockError> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(lock_path)
+            .await
+            .map_err(|e| LockError::Storage(e.to_string()))?;
+
+        file.write_all(node_id.to_string().as_bytes())
+            .await
+            .map_err(|e| LockError::Storage(e.to_string()))
+    }
+}
 
 #[async_trait]
-impl ProjectionLockManager for MockLockManager {
-    async fn acquire_lock(
-        &self,
-        _projection_name: &str,
-        _node_id: &Uuid,
-    ) -> Result<bool, LockError> {
-        Ok(true)
+impl ProjectionLockManager for FileLeaseLockManager {
+    async fn acquire_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<bool, LockError> {
+        tokio::fs::create_dir_all(&self.lock_dir)
+            .await
+            .map_err(|e| LockError::Storage(e.to_string()))?;
+
+        let lock_path = self.lock_path(projection_name);
+        match tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .await
+        {
+            Ok(mut file) => {
+                file.write_all(node_id.to_string().as_bytes())
+                    .await
+                    .map_err(|e| LockError::Storage(e.to_string()))?;
+                return Ok(true);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(LockError::Storage(e.to_string())),
+        }
+
+        if let Some(owner) = self.read_owner(&lock_path).await? {
+            if owner == *node_id {
+                self.write_owner(&lock_path, node_id).await?;
+                return Ok(true);
+            }
+        }
+
+        if self.is_stale(&lock_path).await? {
+            if let Err(e) = tokio::fs::remove_file(&lock_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(LockError::Storage(e.to_string()));
+                }
+            }
+
+            match tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(mut file) => {
+                    file.write_all(node_id.to_string().as_bytes())
+                        .await
+                        .map_err(|e| LockError::Storage(e.to_string()))?;
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(e) => return Err(LockError::Storage(e.to_string())),
+            }
+        }
+
+        Ok(false)
     }
 
-    async fn keep_alive(&self, _projection_name: &str, _node_id: &Uuid) -> Result<(), LockError> {
-        Ok(())
+    async fn keep_alive(&self, projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
+        let lock_path = self.lock_path(projection_name);
+        match self.read_owner(&lock_path).await? {
+            Some(owner) if owner == *node_id => self.write_owner(&lock_path, node_id).await,
+            _ => Err(LockError::AlreadyHeld),
+        }
     }
 
-    async fn release_lock(&self, _projection_name: &str, _node_id: &Uuid) -> Result<(), LockError> {
+    async fn release_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
+        let lock_path = self.lock_path(projection_name);
+        if let Some(owner) = self.read_owner(&lock_path).await? {
+            if owner != *node_id {
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+
+        if let Err(e) = tokio::fs::remove_file(lock_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(LockError::Storage(e.to_string()));
+            }
+        }
         Ok(())
     }
 }
@@ -319,6 +440,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(EnvironmentNodeDiscovery::new())
         };
 
+    let discovery_for_probe = peer_discovery.clone();
+
     tokio::fs::create_dir_all(&data_dir).await?;
 
     let event_store_path = format!("{}/todo_events.bin", data_dir);
@@ -340,7 +463,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("***************************************************");
 
     let bus = EventBus::<TodoEvent>::new(1024);
-    let mock_lock_manager = Arc::new(MockLockManager);
+    let lock_dir = format!("{}/locks", data_dir);
+    let lock_manager = Arc::new(FileLeaseLockManager::new(
+        lock_dir,
+        std::time::Duration::from_secs(15),
+    ));
     let projection_version = Arc::new(AtomicU64::new(0));
 
     let ephemeral_actor = EphemeralProjectionActor::new(
@@ -358,10 +485,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_store.clone(),
         Arc::new(EmailNotificationProjection),
         snapshot_store.clone(),
-        mock_lock_manager,
+        lock_manager,
         node_id,
     );
     tokio::spawn(durable_actor.spawn());
+
+    let self_mesh_addr = mesh_addr.clone();
+    tokio::spawn(async move {
+        loop {
+            match discovery_for_probe.discover_nodes().await {
+                Ok(nodes) => {
+                    let peer_count = nodes.iter().filter(|n| n.address != self_mesh_addr).count();
+                    tracing::info!("Discovery probe: {} peer(s) visible", peer_count);
+                }
+                Err(e) => tracing::warn!("Discovery probe failed: {}", e),
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    });
 
     let app_state = AppState {
         node_id,
@@ -371,6 +513,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         projection_state,
         projection_version,
     };
+
+    let mesh_for_subscribe = app_state.mesh.clone();
+    let bus_for_mesh = app_state.bus.clone();
+    tokio::spawn(async move {
+        let mut incoming = mesh_for_subscribe.subscribe().await;
+        while let Some(result) = incoming.next().await {
+            match result {
+                Ok(event) => {
+                    let _ = bus_for_mesh.publish(event);
+                }
+                Err(e) => tracing::warn!("Mesh subscribe error: {}", e),
+            }
+        }
+    });
 
     let app = Router::new()
         .route("/todos", axum::routing::get(get_todos).post(create_todo))

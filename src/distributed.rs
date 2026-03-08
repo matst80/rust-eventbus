@@ -217,7 +217,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
     async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
         let nodes = {
             let cache = self.discovery_cache.lock();
-            if cache.0.elapsed() < std::time::Duration::from_secs(10) {
+            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
                 Some(cache.1.clone())
             } else {
                 None
@@ -233,6 +233,18 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             n
         };
 
+        let my_addr = self.listen_addr.clone();
+        let active_peer_addrs: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.address != my_addr)
+            .map(|n| n.address.clone())
+            .collect();
+
+        {
+            let mut c = self.connections.lock().await;
+            c.retain(|addr, _| active_peer_addrs.contains(addr));
+        }
+
         let event_payload =
             bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))?;
         let event_id = event.id;
@@ -246,7 +258,6 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
 
         let payload_arc = Arc::new(full_payload);
         let conns_ref = self.connections.clone();
-        let my_addr = self.listen_addr.clone();
 
         for node in nodes {
             // Self-filter check (ip-based as fallback for nil-id discovery)

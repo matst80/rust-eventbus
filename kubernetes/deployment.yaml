@@ -25,22 +25,46 @@ spec:
         env:
         - name: PORT
           value: "3000"
+        - name: HOST
+          value: "0.0.0.0"
         - name: MESH_PORT
           value: "3001"
         - name: DATA_DIR
           value: "/app/data"
         - name: RUST_LOG
           value: "rust_eventbus=info,todo_app=info"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         - name: DNS_QUERY
-          value: "todo-app-headless.dev.svc.cluster.local"
+          value: "todo-app-headless.$(POD_NAMESPACE).svc.cluster.local"
         - name: NODE_ID
           valueFrom:
             fieldRef:
               fieldPath: metadata.uid
+        readinessProbe:
+          tcpSocket:
+            port: 3001
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 2
+        livenessProbe:
+          tcpSocket:
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 2
+        startupProbe:
+          tcpSocket:
+            port: 3001
+          failureThreshold: 30
+          periodSeconds: 2
+          timeoutSeconds: 2
         volumeMounts:
         - name: data-storage
           mountPath: /app/data
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: 30
       nodeSelector:
         kubernetes.io/arch: arm64
       volumes:
@@ -55,6 +79,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: nfs-client
   resources:
     requests:
       storage: 1Gi
