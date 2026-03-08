@@ -259,35 +259,44 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             let conns = conns_ref.clone();
 
             tokio::spawn(async move {
-                let mut stream = {
+                let stream = {
                     let mut c = conns.lock().await;
                     c.remove(&addr)
                 };
 
-                if stream.is_none() {
+                let mut send_success = false;
+
+                if let Some(mut s) = stream {
+                    if s.write_all(&payload).await.is_ok() {
+                        tracing::info!("Mesh OUT: Event {} (to Peer {})", event_id, addr);
+                        let mut c = conns.lock().await;
+                        c.insert(addr.clone(), s);
+                        send_success = true;
+                    } else {
+                        tracing::debug!("Mesh send failed to {}, retrying connection", addr);
+                    }
+                }
+
+                if !send_success {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(2),
                         tokio::net::TcpStream::connect(&addr),
                     )
                     .await
                     {
-                        Ok(Ok(s)) => {
+                        Ok(Ok(mut s)) => {
                             let _ = s.set_nodelay(true);
-                            stream = Some(s);
+                            if let Err(e) = s.write_all(&payload).await {
+                                tracing::debug!("Mesh send failed to {}, closing: {}", addr, e);
+                            } else {
+                                tracing::info!("Mesh OUT: Event {} (to Peer {})", event_id, addr);
+                                let mut c = conns.lock().await;
+                                c.insert(addr, s);
+                            }
                         }
                         _ => {
                             tracing::debug!("Mesh connect failed to {}", addr);
                         }
-                    }
-                }
-
-                if let Some(mut s) = stream {
-                    if let Err(e) = s.write_all(&payload).await {
-                        tracing::debug!("Mesh send failed to {}, closing: {}", addr, e);
-                    } else {
-                        tracing::info!("Mesh OUT: Event {} (to Peer {})", event_id, addr);
-                        let mut c = conns.lock().await;
-                        c.insert(addr, s);
                     }
                 }
             });
@@ -324,13 +333,8 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                             use tokio::io::AsyncReadExt;
 
                             loop {
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(30),
-                                    socket.read_exact(&mut len_buf),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(_)) => {
+                                match socket.read_exact(&mut len_buf).await {
+                                    Ok(_) => {
                                         let body_len = u32::from_be_bytes(len_buf) as usize;
                                         if body_len > 10 * 1024 * 1024 {
                                             tracing::error!(
@@ -378,7 +382,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                                             ),
                                         }
                                     }
-                                    Ok(Err(e)) => {
+                                    Err(e) => {
                                         if e.kind() != std::io::ErrorKind::UnexpectedEof {
                                             tracing::debug!(
                                                 "Mesh connection closed by {}: {}",
@@ -388,7 +392,6 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                                         }
                                         break;
                                     }
-                                    Err(_) => break, // Timeout
                                 }
                                 tokio::task::yield_now().await;
                             }
