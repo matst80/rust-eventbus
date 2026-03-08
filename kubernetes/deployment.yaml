@@ -32,7 +32,7 @@ spec:
         - name: RUST_LOG
           value: "rust_eventbus=debug,todo_app=info"
         - name: DNS_QUERY
-          value: "todo-app-headless.default.svc.cluster.local"
+          value: "todo-app-headless.dev.svc.cluster.local"
         - name: NODE_ID
           valueFrom:
             fieldRef:

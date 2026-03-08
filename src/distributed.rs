@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -181,6 +184,7 @@ pub struct TcpPubSub<E: EventPayload> {
     listen_addr: String,
     discovery: Arc<dyn NodeDiscovery>,
     discovery_cache: Arc<parking_lot::Mutex<(std::time::Instant, Vec<Node>)>>,
+    connections: Arc<Mutex<HashMap<String, tokio::net::TcpStream>>>,
     _phantom: std::marker::PhantomData<E>,
 }
 
@@ -194,6 +198,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 vec![],
             ))),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -202,8 +207,8 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
 #[async_trait]
 impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E> for TcpPubSub<E> {
     async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
-        // 1. Check if discovery cache is valid
-        let cached_nodes = {
+        // 1. Get nodes from cache
+        let nodes = {
             let cache = self.discovery_cache.lock();
             if cache.0.elapsed() < std::time::Duration::from_secs(10) {
                 Some(cache.1.clone())
@@ -212,78 +217,51 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             }
         };
 
-        // 2. Refresh discovery if needed (outside the lock)
-        let nodes = if let Some(nodes) = cached_nodes {
-            nodes
+        let nodes = if let Some(n) = nodes {
+            n
         } else {
-            let new_nodes = self.discovery.discover_nodes().await?;
+            let n = self.discovery.discover_nodes().await?;
             let mut cache = self.discovery_cache.lock();
-            *cache = (std::time::Instant::now(), new_nodes.clone());
-            new_nodes
+            *cache = (std::time::Instant::now(), n.clone());
+            n
         };
 
         let event_payload = bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))?;
-        
-        // Protocol: [16 bytes Sender Node UUID] + [Event Payload]
-        let mut full_payload = Vec::with_capacity(16 + event_payload.len());
+        let mut full_payload = Vec::with_capacity(20 + event_payload.len());
+        let total_len = (16 + event_payload.len()) as u32;
+        full_payload.extend_from_slice(&total_len.to_be_bytes());
         full_payload.extend_from_slice(self.node_id.as_bytes());
         full_payload.extend_from_slice(&event_payload);
-        let payload_arc = Arc::new(full_payload);
-
-        tracing::debug!("Broadcasting event {} to {} nodes", event.id, nodes.len());
+        
+        let event_id = event.id;
+        let mut conns = self.connections.lock().await;
 
         for node in nodes {
-            // Self-filtering logic
-            if node.address == self.listen_addr {
-                continue;
-            }
-
-            let addr = node.address.clone();
-            let payload_clone = payload_arc.clone();
-            let event_id = event.id;
+            if node.address == self.listen_addr { continue; }
             
-            tokio::spawn(async move {
-                let mut attempts = 0;
-                let max_attempts = 3;
-                let mut backoff = std::time::Duration::from_millis(100);
-
-                while attempts < max_attempts {
-                    // Timeout connection attempts to prevent resource exhaustion
-                    let connect_future = tokio::net::TcpStream::connect(&addr);
-                    match tokio::time::timeout(std::time::Duration::from_secs(5), connect_future).await {
-                        Ok(Ok(mut stream)) => {
-                            use tokio::io::AsyncWriteExt;
-                            
-                            // Protocol: [4 bytes length-prefix] + [16 bytes Node ID] + [Payload]
-                            let total_len = payload_clone.len() as u32;
-                            let mut header = [0u8; 4];
-                            header.copy_from_slice(&total_len.to_be_bytes());
-
-                            if let Err(e) = stream.write_all(&header).await {
-                                tracing::error!("Failed to write header to {}: {}", addr, e);
-                            } else if let Err(e) = stream.write_all(&payload_clone).await {
-                                tracing::error!("Failed to write payload to {}: {}", addr, e);
-                            } else {
-                                let _ = stream.flush().await;
-                                return; // Success
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            attempts += 1;
-                            if attempts >= max_attempts {
-                                tracing::error!("Connection failed to {} for event {}: {}", addr, event_id, e);
-                            } else {
-                                tokio::time::sleep(backoff).await;
-                                backoff *= 2;
-                            }
-                        }
-                        Err(_) => {
-                            tracing::warn!("Connection timeout to {} for event {}", addr, event_id);
-                            return;
-                        }
+            let addr = node.address;
+            let mut stream = if let Some(s) = conns.remove(&addr) {
+                s
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+                    Ok(Ok(s)) => {
+                        let _ = s.set_nodelay(true);
+                        s
+                    }
+                    _ => {
+                        tracing::debug!("Could not connect to peer {}", addr);
+                        continue;
                     }
                 }
-            });
+            };
+
+            if let Err(e) = stream.write_all(&full_payload).await {
+                tracing::debug!("Failed send to {}, closing stale: {}", addr, e);
+            } else {
+                tracing::info!("Mesh OUT: {} (to {})", event_id, addr);
+                conns.insert(addr, stream);
+            }
+            tokio::task::yield_now().await;
         }
         Ok(())
     }
@@ -291,99 +269,82 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
     async fn subscribe(&self) -> BoxStream<'static, Result<Event<E>, DistributedError>> {
         let addr = self.listen_addr.clone();
         let my_node_id = self.node_id;
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
         
-        let stream = futures::stream::unfold(None, move |state| {
-            let addr = addr.clone();
-            let my_node_id = my_node_id;
-            async move {
-                let listener = match state {
-                    Some(l) => l,
-                    None => {
-                        let mut bind_attempts = 0;
-                        let max_bind_attempts = 10;
-                        let mut backoff = std::time::Duration::from_secs(1);
-                        
-                        loop {
-                            match tokio::net::TcpListener::bind(&addr).await {
-                                Ok(l) => {
-                                    tracing::info!("Mesh listening on {}", addr);
-                                    break l;
-                                }
-                                Err(e) => {
-                                    bind_attempts += 1;
-                                    if bind_attempts >= max_bind_attempts {
-                                        tracing::error!("Failed to bind mesh listener to {} after {} attempts: {}", addr, max_bind_attempts, e);
-                                        return None;
-                                    }
-                                    tracing::warn!("Failed to bind mesh listener to {} (attempt {}/{}): {}. Retrying in {:?}...", addr, bind_attempts, max_bind_attempts, e, backoff);
-                                    tokio::time::sleep(backoff).await;
-                                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
-                                }
-                            }
-                        }
-                    }
-                };
+        tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => {
+                    tracing::info!("Mesh listening on {} (Node: {})", addr, my_node_id);
+                    l
+                }
+                Err(e) => {
+                    tracing::error!("FATAL: Failed to bind mesh listener: {}", e);
+                    return;
+                }
+            };
 
-                loop {
-                    match listener.accept().await {
-                        Ok((mut socket, peer_addr)) => {
-                            let my_node_id = my_node_id;
-                            
-                            // Process each connection in a separate short-lived task to keep listener free
-                            // and use a length-prefixed protocol to avoid read_to_end infinite waiting.
+            loop {
+                match listener.accept().await {
+                    Ok((mut socket, peer_addr)) => {
+                        let tx = tx.clone();
+                        let my_node_id = my_node_id;
+                        tokio::spawn(async move {
+                            tracing::trace!("Mesh connection from {}", peer_addr);
                             let mut len_buf = [0u8; 4];
                             use tokio::io::AsyncReadExt;
                             
-                            match tokio::time::timeout(std::time::Duration::from_secs(2), socket.read_exact(&mut len_buf)).await {
-                                Ok(Ok(_)) => {
-                                    let body_len = u32::from_be_bytes(len_buf) as usize;
-                                    if body_len > 10 * 1024 * 1024 { // 10MB safety limit
-                                        tracing::error!("Received oversized packet ({} bytes) from {}", body_len, peer_addr);
-                                        continue;
-                                    }
-
-                                    let mut body = vec![0u8; body_len];
-                                    match tokio::time::timeout(std::time::Duration::from_secs(5), socket.read_exact(&mut body)).await {
-                                        Ok(Ok(_)) => {
-                                            if body.len() < 16 {
-                                                continue;
-                                            }
-                                            
-                                            let mut id_bytes = [0u8; 16];
-                                            id_bytes.copy_from_slice(&body[..16]);
-                                            let sender_id = Uuid::from_bytes(id_bytes);
-
-                                            if sender_id == my_node_id {
-                                                continue;
-                                            }
-
-                                            match bincode::deserialize::<Event<E>>(&body[16..]) {
-                                                Ok(event) => {
-                                                    return Some((Ok(event), Some(listener)));
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!("Fail deserialize from {}: {}", peer_addr, e);
-                                                }
-                                            }
+                            loop {
+                                match tokio::time::timeout(std::time::Duration::from_secs(30), socket.read_exact(&mut len_buf)).await {
+                                    Ok(Ok(_)) => {
+                                        let body_len = u32::from_be_bytes(len_buf) as usize;
+                                        if body_len > 10 * 1024 * 1024 {
+                                            tracing::error!("Oversized packet: {} from {}", body_len, peer_addr);
+                                            break;
                                         }
-                                        _ => tracing::warn!("Timeout reading body from {}", peer_addr),
+
+                                        let mut body = vec![0u8; body_len];
+                                        if let Err(e) = socket.read_exact(&mut body).await {
+                                            tracing::error!("Body read error from {}: {}", peer_addr, e);
+                                            break;
+                                        }
+
+                                        if body.len() < 16 { continue; }
+                                        let mut id_bytes = [0u8; 16];
+                                        id_bytes.copy_from_slice(&body[..16]);
+                                        let sender_id = Uuid::from_bytes(id_bytes);
+
+                                        if sender_id == my_node_id { continue; }
+
+                                        match bincode::deserialize::<Event<E>>(&body[16..]) {
+                                            Ok(event) => {
+                                                tracing::info!("Mesh IN: {} (from {})", event.id, sender_id);
+                                                let _ = tx.send(Ok(event)).await;
+                                            }
+                                            Err(e) => tracing::error!("Bincode error from {}: {}", peer_addr, e),
+                                        }
                                     }
+                                    Ok(Err(e)) => {
+                                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                                            tracing::debug!("Mesh connection closed by {}: {}", peer_addr, e);
+                                        }
+                                        break;
+                                    }
+                                    Err(_) => break, // Timeout
                                 }
-                                _ => {
-                                    // Soft timeout or noise on the port, just continue
-                                }
+                                tokio::task::yield_now().await;
                             }
-                        }
-                        Err(e) => {
-                            tracing::error!("Accept error: {}", e);
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("Mesh accept error: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
+                tokio::task::yield_now().await;
             }
         });
 
-        Box::pin(stream)
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
 
