@@ -144,8 +144,10 @@ where
                     }
                     ProjectionCommand::Run => {}
                 }
-                // Acknowledge command by resetting to Run.
-                let _ = self.cmd_tx.send(ProjectionCommand::Run);
+                // Acknowledge command by resetting to Run (only if it was a command).
+                if cmd != ProjectionCommand::Run {
+                    let _ = self.cmd_tx.send(ProjectionCommand::Run);
+                }
 
                 // 1. Load latest state from snapshot
                 let mut current_seq = 0;
@@ -192,6 +194,8 @@ where
 
                 // 4. Process real-time events
                 let mut restart = false;
+                // Mark the watch channel as seen so we don't immediately restart
+                cmd_rx.borrow_and_update();
                 while !restart {
                     tokio::select! {
                         biased;
@@ -328,7 +332,9 @@ where
                         }
                         ProjectionCommand::Run => {}
                     }
-                    let _ = self.cmd_tx.send(ProjectionCommand::Run);
+                    if cmd != ProjectionCommand::Run {
+                        let _ = self.cmd_tx.send(ProjectionCommand::Run);
+                    }
 
                     let mut current_seq = 0;
                     if cmd == ProjectionCommand::Run {
@@ -364,6 +370,8 @@ where
 
                     // Process live events
                     let mut restart = false;
+                    // Mark the watch channel as seen so we don't immediately restart
+                    cmd_rx.borrow_and_update();
                     while !restart {
                         // Re-verify/extend lock periodically
                         if self.lock_manager.keep_alive(self.projection.name(), &self.node_id).await.is_err() {
