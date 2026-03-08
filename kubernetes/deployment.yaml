@@ -30,7 +30,7 @@ spec:
         - name: DATA_DIR
           value: "/app/data"
         - name: RUST_LOG
-          value: "rust_eventbus=debug,todo_app=info"
+          value: "rust_eventbus=info,todo_app=info"
         - name: DNS_QUERY
           value: "todo-app-headless.dev.svc.cluster.local"
         - name: NODE_ID
@@ -40,6 +40,7 @@ spec:
         volumeMounts:
         - name: data-storage
           mountPath: /app/data
+      terminationGracePeriodSeconds: 10
       nodeSelector:
         kubernetes.io/arch: arm64
       volumes:

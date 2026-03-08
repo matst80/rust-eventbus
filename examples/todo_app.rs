@@ -283,10 +283,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh_addr = format!("{}:{}", host, mesh_port);
     let mesh: Arc<TcpPubSub<TodoEvent>> = Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
 
-    println!("Node ID:   {}", node_id);
-    println!("API Listen: {}", listen_addr);
-    println!("Mesh Listen: {}", mesh_addr);
-    println!("Storage:   {}", data_dir);
+    tracing::info!("***************************************************");
+    tracing::info!("Starting Node ID: {}", node_id);
+    tracing::info!("API Listen:      {}", listen_addr);
+    tracing::info!("Mesh Listen:     {}", mesh_addr);
+    tracing::info!("Storage:         {}", data_dir);
+    tracing::info!("***************************************************");
 
     let bus = EventBus::<TodoEvent>::new(1024);
     let mock_lock_manager = Arc::new(MockLockManager);
@@ -351,8 +353,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            println!("\nShutting down gracefully...");
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Received SIGINT, shutting down...");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down...");
+                }
+            }
         })
         .await?;
 

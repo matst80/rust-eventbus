@@ -207,7 +207,6 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
 #[async_trait]
 impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E> for TcpPubSub<E> {
     async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
-        // 1. Get nodes from cache
         let nodes = {
             let cache = self.discovery_cache.lock();
             if cache.0.elapsed() < std::time::Duration::from_secs(10) {
@@ -227,40 +226,55 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         };
 
         let event_payload = bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))?;
+        let event_id = event.id;
+        let my_node_id = self.node_id;
+        
         let mut full_payload = Vec::with_capacity(20 + event_payload.len());
         let total_len = (16 + event_payload.len()) as u32;
         full_payload.extend_from_slice(&total_len.to_be_bytes());
-        full_payload.extend_from_slice(self.node_id.as_bytes());
+        full_payload.extend_from_slice(my_node_id.as_bytes());
         full_payload.extend_from_slice(&event_payload);
         
-        let event_id = event.id;
-        let mut conns = self.connections.lock().await;
+        let payload_arc = Arc::new(full_payload);
+        let conns_ref = self.connections.clone();
+        let my_addr = self.listen_addr.clone();
 
         for node in nodes {
-            if node.address == self.listen_addr { continue; }
+            // Self-filter check (ip-based as fallback for nil-id discovery)
+            if node.address == my_addr { continue; }
             
             let addr = node.address;
-            let mut stream = if let Some(s) = conns.remove(&addr) {
-                s
-            } else {
-                match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
-                    Ok(Ok(s)) => {
-                        let _ = s.set_nodelay(true);
-                        s
-                    }
-                    _ => {
-                        tracing::debug!("Could not connect to peer {}", addr);
-                        continue;
+            let payload = payload_arc.clone();
+            let conns = conns_ref.clone();
+
+            tokio::spawn(async move {
+                let mut stream = {
+                    let mut c = conns.lock().await;
+                    c.remove(&addr)
+                };
+
+                if stream.is_none() {
+                    match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+                        Ok(Ok(s)) => {
+                            let _ = s.set_nodelay(true);
+                            stream = Some(s);
+                        }
+                        _ => {
+                            tracing::debug!("Mesh connect failed to {}", addr);
+                        }
                     }
                 }
-            };
 
-            if let Err(e) = stream.write_all(&full_payload).await {
-                tracing::debug!("Failed send to {}, closing stale: {}", addr, e);
-            } else {
-                tracing::info!("Mesh OUT: {} (to {})", event_id, addr);
-                conns.insert(addr, stream);
-            }
+                if let Some(mut s) = stream {
+                    if let Err(e) = s.write_all(&payload).await {
+                        tracing::debug!("Mesh send failed to {}, closing: {}", addr, e);
+                    } else {
+                        tracing::info!("Mesh OUT: Event {} (to Peer {})", event_id, addr);
+                        let mut c = conns.lock().await;
+                        c.insert(addr, s);
+                    }
+                }
+            });
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -317,7 +331,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
 
                                         match bincode::deserialize::<Event<E>>(&body[16..]) {
                                             Ok(event) => {
-                                                tracing::info!("Mesh IN: {} (from {})", event.id, sender_id);
+                                                tracing::info!("Mesh IN: Event {} (from Peer {})", event.id, sender_id);
                                                 let _ = tx.send(Ok(event)).await;
                                             }
                                             Err(e) => tracing::error!("Bincode error from {}: {}", peer_addr, e),
