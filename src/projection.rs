@@ -133,7 +133,11 @@ where
                 match cmd {
                     ProjectionCommand::Reset => {
                         if let Err(e) = self.snapshot_store.delete(self.projection.name()).await {
-                            eprintln!("Failed to delete snapshot for {}: {}", self.projection.name(), e);
+                            eprintln!(
+                                "Failed to delete snapshot for {}: {}",
+                                self.projection.name(),
+                                e
+                            );
                         }
                         let mut state_lock = self.state.lock().await;
                         *state_lock = S::default();
@@ -167,27 +171,33 @@ where
 
                 // 3. Catch up from EventStore
                 let mut stream = self.event_store.read_all_from(current_seq + 1);
-                    while let Some(Ok(event)) = stream.next().await {
-                        let mut state_lock = self.state.lock().await;
-                        if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                            current_seq = event.global_sequence_num;
-                            events_since_snapshot += 1;
-                            if events_since_snapshot >= self.snapshot_interval {
-                                events_since_snapshot = 0;
-                                if let Err(e) = self.snapshot_store
-                                    .save(self.projection.name(), current_seq, &*state_lock)
-                                    .await
-                                {
-                                    eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
-                                }
+                while let Some(Ok(event)) = stream.next().await {
+                    let mut state_lock = self.state.lock().await;
+                    if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
+                        current_seq = event.global_sequence_num;
+                        events_since_snapshot += 1;
+                        if events_since_snapshot >= self.snapshot_interval {
+                            events_since_snapshot = 0;
+                            if let Err(e) = self
+                                .snapshot_store
+                                .save(self.projection.name(), current_seq, &*state_lock)
+                                .await
+                            {
+                                eprintln!(
+                                    "Failed to save snapshot for {}: {}",
+                                    self.projection.name(),
+                                    e
+                                );
                             }
                         }
-                        tokio::task::yield_now().await;
                     }
+                    tokio::task::yield_now().await;
+                }
                 // Save snapshot after catch-up if there were unsaved events.
                 if events_since_snapshot > 0 {
                     let state_lock = self.state.lock().await;
-                    let _ = self.snapshot_store
+                    let _ = self
+                        .snapshot_store
                         .save(self.projection.name(), current_seq, &*state_lock)
                         .await;
                 }
@@ -317,7 +327,11 @@ where
 
             loop {
                 // 1. Try to acquire lock
-                if let Ok(true) = self.lock_manager.acquire_lock(self.projection.name(), &self.node_id).await {
+                if let Ok(true) = self
+                    .lock_manager
+                    .acquire_lock(self.projection.name(), &self.node_id)
+                    .await
+                {
                     // Check for pending replay/reset commands.
                     let cmd = *cmd_rx.borrow_and_update();
                     match cmd {
@@ -359,13 +373,19 @@ where
                             events_since_snapshot += 1;
                             if events_since_snapshot >= self.snapshot_interval {
                                 events_since_snapshot = 0;
-                                let _ = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await;
+                                let _ = self
+                                    .snapshot_store
+                                    .save(self.projection.name(), current_seq, &*state_lock)
+                                    .await;
                             }
                         }
                     }
                     if events_since_snapshot > 0 {
                         let state_lock = self.state.lock().await;
-                        let _ = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await;
+                        let _ = self
+                            .snapshot_store
+                            .save(self.projection.name(), current_seq, &*state_lock)
+                            .await;
                     }
 
                     // Process live events
@@ -374,7 +394,12 @@ where
                     cmd_rx.borrow_and_update();
                     while !restart {
                         // Re-verify/extend lock periodically
-                        if self.lock_manager.keep_alive(self.projection.name(), &self.node_id).await.is_err() {
+                        if self
+                            .lock_manager
+                            .keep_alive(self.projection.name(), &self.node_id)
+                            .await
+                            .is_err()
+                        {
                             break; // Lost lock
                         }
 
