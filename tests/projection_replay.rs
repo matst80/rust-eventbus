@@ -53,7 +53,8 @@ impl Projection<TestEvent, CounterState> for CounterProjection {
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
-        "{}_{}", name,
+        "{}_{}",
+        name,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -150,7 +151,8 @@ async fn test_projection_reset() {
     }
 
     // Verify snapshot was saved
-    let snap: Option<(u64, CounterState)> = snapshot_store.load("counter_projection").await.unwrap();
+    let snap: Option<(u64, CounterState)> =
+        snapshot_store.load("counter_projection").await.unwrap();
     assert!(snap.is_some(), "Snapshot should exist before reset");
 
     // Reset — deletes snapshot and replays
@@ -208,8 +210,12 @@ async fn test_snapshot_interval() {
     }
 
     // Even with high interval, the end-of-catchup flush should have saved
-    let snap: Option<(u64, CounterState)> = snapshot_store.load("counter_projection").await.unwrap();
-    assert!(snap.is_some(), "Snapshot should be saved after catch-up flush");
+    let snap: Option<(u64, CounterState)> =
+        snapshot_store.load("counter_projection").await.unwrap();
+    assert!(
+        snap.is_some(),
+        "Snapshot should be saved after catch-up flush"
+    );
 
     let _ = tokio::fs::remove_file(&event_path).await;
     let _ = tokio::fs::remove_dir_all(&snap_path).await;

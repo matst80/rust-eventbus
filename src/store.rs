@@ -96,7 +96,7 @@ struct FileInnerState {
 impl FileEventStore {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let file_path = path.as_ref().to_path_buf();
-        
+
         // Scan the file to find the highest sequence number to initialize next_global_seq
         let mut next_global_seq = 1;
         if let Ok(file) = File::open(&file_path).await {
@@ -113,7 +113,9 @@ impl FileEventStore {
                             // In a real system, we'd store the max seq in a header or footer.
                             // Note: We use a dummy EventPayload type because we only care about the sequence field which is common.
                             #[derive(Deserialize)]
-                            struct SeqPeek { global_sequence_num: u64 }
+                            struct SeqPeek {
+                                global_sequence_num: u64,
+                            }
                             if let Ok(peek) = bincode::deserialize::<SeqPeek>(&data) {
                                 if peek.global_sequence_num >= next_global_seq {
                                     next_global_seq = peek.global_sequence_num + 1;
@@ -230,11 +232,7 @@ where
             .map_err(|_| StoreError::Other("Background writer closed".into()))?;
 
         // Flush to ensure data is available for reads immediately after append.
-        inner
-            .tx
-            .send(vec![])
-            .await
-            .ok(); // no-op flush sentinel; harmless if writer is gone
+        inner.tx.send(vec![]).await.ok(); // no-op flush sentinel; harmless if writer is gone
 
         Ok(events)
     }
@@ -242,53 +240,53 @@ where
     fn read_all_from(&self, start_sequence: u64) -> BoxStream<'_, Result<Event<E>, StoreError>> {
         let path = self.file_path.clone();
 
-        let stream = unfold(
-            None,
-            move |mut state: Option<BufReader<File>>| {
-                let path_clone = path.clone();
-                async move {
-                    if state.is_none() {
-                        match File::open(&path_clone).await {
-                            Ok(f) => {
-                                state = Some(BufReader::new(f));
-                            }
-                            Err(e) => {
-                                if e.kind() == std::io::ErrorKind::NotFound {
-                                    return None;
-                                }
-                                return Some((Err(StoreError::Io(e)), state));
-                            }
+        let stream = unfold(None, move |mut state: Option<BufReader<File>>| {
+            let path_clone = path.clone();
+            async move {
+                if state.is_none() {
+                    match File::open(&path_clone).await {
+                        Ok(f) => {
+                            state = Some(BufReader::new(f));
                         }
-                    }
-
-                    let mut reader = state.unwrap();
-                    loop {
-                        let mut len_buf = [0u8; 4];
-                        match reader.read_exact(&mut len_buf).await {
-                            Ok(_) => {
-                                let len = u32::from_le_bytes(len_buf) as usize;
-                                let mut data = vec![0u8; len];
-                                match reader.read_exact(&mut data).await {
-                                    Ok(_) => match bincode::deserialize::<Event<E>>(&data) {
-                                        Ok(event) => {
-                                            if event.global_sequence_num >= start_sequence {
-                                                return Some((Ok(event), Some(reader)));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            return Some((Err(StoreError::Serialization(e)), Some(reader)))
-                                        }
-                                    },
-                                    Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
-                                }
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                return None;
                             }
-                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-                            Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
+                            return Some((Err(StoreError::Io(e)), state));
                         }
                     }
                 }
-            },
-        );
+
+                let mut reader = state.unwrap();
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    match reader.read_exact(&mut len_buf).await {
+                        Ok(_) => {
+                            let len = u32::from_le_bytes(len_buf) as usize;
+                            let mut data = vec![0u8; len];
+                            match reader.read_exact(&mut data).await {
+                                Ok(_) => match bincode::deserialize::<Event<E>>(&data) {
+                                    Ok(event) => {
+                                        if event.global_sequence_num >= start_sequence {
+                                            return Some((Ok(event), Some(reader)));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return Some((
+                                            Err(StoreError::Serialization(e)),
+                                            Some(reader),
+                                        ))
+                                    }
+                                },
+                                Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                        Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
+                    }
+                }
+            }
+        });
 
         stream.boxed()
     }
@@ -396,8 +394,10 @@ where
     ) -> Result<(), StoreError> {
         let path = self.file_path(projection_name);
         let tmp_id = uuid::Uuid::new_v4();
-        let tmp_path = self.dir.join(format!("{}.{}.snapshot.tmp", projection_name, tmp_id));
-        
+        let tmp_path = self
+            .dir
+            .join(format!("{}.{}.snapshot.tmp", projection_name, tmp_id));
+
         let env = SnapshotEnvelope {
             sequence_num,
             // We reference state initially for serialization, but the trait bounds require ownership or we can just serialize references.
@@ -405,11 +405,11 @@ where
             state,
         };
         let content = bincode::serialize(&env)?;
-        
+
         let mut tmp_file = tokio::fs::File::create(&tmp_path).await?;
         tmp_file.write_all(&content).await?;
         tmp_file.sync_data().await?;
-        
+
         tokio::fs::rename(tmp_path, path).await?;
         Ok(())
     }
@@ -442,16 +442,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_bincode_event_store() {
-        let dir = std::env::temp_dir().join(format!("eventbus_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "eventbus_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
         let store = FileEventStore::new(&dir).await.unwrap();
 
-        let event1 = Event::new("entity-1", 1, DummyEvent { value: "test1".into() });
-        let event2 = Event::new("entity-1", 2, DummyEvent { value: "test2".into() });
+        let event1 = Event::new(
+            "entity-1",
+            1,
+            DummyEvent {
+                value: "test1".into(),
+            },
+        );
+        let event2 = Event::new(
+            "entity-1",
+            2,
+            DummyEvent {
+                value: "test2".into(),
+            },
+        );
 
-        store.append(vec![event1.clone(), event2.clone()]).await.unwrap();
+        store
+            .append(vec![event1.clone(), event2.clone()])
+            .await
+            .unwrap();
 
-        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> = store.read_all_from(0);
-        
+        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> =
+            store.read_all_from(0);
+
         let mut read_events = Vec::new();
         while let Some(result) = stream.next().await {
             read_events.push(result.unwrap());
@@ -466,7 +488,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_compact_keeps_latest() {
-        let dir = std::env::temp_dir().join(format!("compact_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "compact_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
         let store = FileEventStore::new(&dir).await.unwrap();
 
         // 3 events for aggregate "a", 1 for "b"
@@ -478,10 +506,13 @@ mod tests {
         ];
         store.append(events).await.unwrap();
 
-        let removed = EventStore::<DummyEvent>::compact(&store, CompactionRule::LatestPerAggregate).await.unwrap();
+        let removed = EventStore::<DummyEvent>::compact(&store, CompactionRule::LatestPerAggregate)
+            .await
+            .unwrap();
         assert_eq!(removed, 2); // a1 and a2 removed
 
-        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> = store.read_all_from(0);
+        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> =
+            store.read_all_from(0);
         let mut remaining = Vec::new();
         while let Some(Ok(ev)) = stream.next().await {
             remaining.push(ev);
@@ -495,7 +526,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate_before() {
-        let dir = std::env::temp_dir().join(format!("truncate_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "truncate_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
         let store = FileEventStore::new(&dir).await.unwrap();
 
         let events = vec![
@@ -506,10 +543,13 @@ mod tests {
         store.append(events).await.unwrap();
 
         // Truncate events with seq <= 2 (removes e1 seq=1, e2 seq=2)
-        let removed = EventStore::<DummyEvent>::truncate_before(&store, 2).await.unwrap();
+        let removed = EventStore::<DummyEvent>::truncate_before(&store, 2)
+            .await
+            .unwrap();
         assert_eq!(removed, 2);
 
-        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> = store.read_all_from(0);
+        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> =
+            store.read_all_from(0);
         let mut remaining = Vec::new();
         while let Some(Ok(ev)) = stream.next().await {
             remaining.push(ev);
@@ -522,7 +562,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_bincode_snapshot_store() {
-        let dir = std::env::temp_dir().join(format!("snapshot_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "snapshot_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
         let store = FileSnapshotStore::new(&dir).await.unwrap();
 
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -535,7 +581,7 @@ mod tests {
 
         let loaded = store.load("dummy_proj").await.unwrap();
         assert!(loaded.is_some());
-        
+
         let (seq, loaded_state): (u64, DummyState) = loaded.unwrap();
         assert_eq!(seq, 5);
         assert_eq!(loaded_state.counter, 42);
@@ -545,17 +591,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_delete() {
-        let dir = std::env::temp_dir().join(format!("snap_del_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "snap_del_test_{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_micros()
+        ));
         let store = FileSnapshotStore::new(&dir).await.unwrap();
 
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
-        struct S { v: u32 }
+        struct S {
+            v: u32,
+        }
 
-        SnapshotStore::<S>::save(&store, "proj", 10, &S { v: 1 }).await.unwrap();
-        assert!(SnapshotStore::<S>::load(&store, "proj").await.unwrap().is_some());
+        SnapshotStore::<S>::save(&store, "proj", 10, &S { v: 1 })
+            .await
+            .unwrap();
+        assert!(SnapshotStore::<S>::load(&store, "proj")
+            .await
+            .unwrap()
+            .is_some());
 
         SnapshotStore::<S>::delete(&store, "proj").await.unwrap();
-        assert!(SnapshotStore::<S>::load(&store, "proj").await.unwrap().is_none());
+        assert!(SnapshotStore::<S>::load(&store, "proj")
+            .await
+            .unwrap()
+            .is_none());
 
         // Deleting again is idempotent
         SnapshotStore::<S>::delete(&store, "proj").await.unwrap();
