@@ -5,6 +5,7 @@
 pub mod bus;
 pub mod distributed;
 pub mod cluster;
+pub mod cluster_config;
 pub mod event;
 pub mod projection;
 pub mod store;

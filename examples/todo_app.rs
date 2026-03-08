@@ -63,6 +63,9 @@ pub struct TodoItem {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TodoState {
     pub todos: HashMap<String, TodoItem>,
+    /// Maintains the order todos were added (by aggregate id).
+    /// Kept in the projection so fetches don't need to re-sort.
+    pub order: Vec<String>,
 }
 
 // 3. Define Projections
@@ -86,14 +89,18 @@ impl Projection<TodoEvent, TodoState> for TodoProjection {
 
         match &event.payload {
             TodoEvent::TodoCreated { title } => {
-                state.todos.insert(
-                    aggregate_id.clone(),
-                    TodoItem {
-                        id: aggregate_id,
-                        title: title.clone(),
-                        completed: false,
-                    },
-                );
+                // Only insert if not already present and maintain insertion order.
+                if !state.todos.contains_key(&aggregate_id) {
+                    state.todos.insert(
+                        aggregate_id.clone(),
+                        TodoItem {
+                            id: aggregate_id.clone(),
+                            title: title.clone(),
+                            completed: false,
+                        },
+                    );
+                    state.order.push(aggregate_id);
+                }
             }
             TodoEvent::TodoCompleted => {
                 if let Some(todo) = state.todos.get_mut(&aggregate_id) {
@@ -102,6 +109,7 @@ impl Projection<TodoEvent, TodoState> for TodoProjection {
             }
             TodoEvent::TodoDeleted => {
                 state.todos.remove(&aggregate_id);
+                state.order.retain(|id| id != &aggregate_id);
             }
         }
         Ok(())
@@ -162,7 +170,12 @@ async fn get_todos(
     let etag = format!("\"{}\"", version);
 
     let proj = state.projection_state.lock().await;
-    let todos: Vec<TodoItem> = proj.todos.values().cloned().collect();
+    let mut todos: Vec<TodoItem> = Vec::with_capacity(proj.order.len());
+    for id in proj.order.iter() {
+        if let Some(item) = proj.todos.get(id) {
+            todos.push(item.clone());
+        }
+    }
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
@@ -278,26 +291,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Starting Distributed Todo App Node (TCP Mesh)...");
 
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse()
-        .expect("PORT must be a number");
+    let config = rust_eventbus::cluster::ClusterConfig::from_env();
+    let port = config.port;
+    let host = config.host.clone();
+    let mesh_bind_host = config.mesh_bind_host.clone();
 
-    let _mesh_port: u16 = std::env::var("MESH_PORT")
-        .unwrap_or_else(|_| "3001".to_string())
-        .parse()
-        .expect("MESH_PORT must be a number");
-
-    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let mesh_bind_host = std::env::var("MESH_BIND_HOST").unwrap_or_else(|_| host.clone());
-    let _mesh_advertise_host = std::env::var("MESH_ADVERTISE_HOST")
-        .ok()
-        .or_else(|| std::env::var("POD_IP").ok())
-        .unwrap_or_else(|| mesh_bind_host.clone());
-
-    let _data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
-
-    let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>().await?;
+    let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>(config).await?;
     let node_id = cluster.node_id;
     let event_store = cluster.event_store.clone();
     let snapshot_store = cluster.snapshot_store.clone();

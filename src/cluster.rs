@@ -157,37 +157,24 @@ pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde
     pub projection_version: Arc<AtomicU64>,
     pub discovery: Arc<dyn NodeDiscovery>,
 }
-
 /// Initialize cluster-related components from environment variables (DATA_DIR, PORT, MESH_* etc.).
+pub use crate::cluster_config::ClusterConfig;
 pub async fn init_cluster<
     E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>,
->() -> Result<ClusterComponents<E>, Box<dyn Error>> {
-    let _port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse()
-        .expect("PORT must be a number");
+>(config: ClusterConfig) -> Result<ClusterComponents<E>, Box<dyn Error>> {
+    let _port: u16 = config.port;
 
-    let mesh_port: u16 = std::env::var("MESH_PORT")
-        .unwrap_or_else(|_| "3001".to_string())
-        .parse()
-        .expect("MESH_PORT must be a number");
+    let mesh_port: u16 = config.mesh_port;
 
-    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let mesh_bind_host = std::env::var("MESH_BIND_HOST").unwrap_or_else(|_| host.clone());
-    let mesh_advertise_host = std::env::var("MESH_ADVERTISE_HOST")
-        .ok()
-        .or_else(|| std::env::var("POD_IP").ok())
-        .unwrap_or_else(|| mesh_bind_host.clone());
+    let mesh_bind_host = config.mesh_bind_host.clone();
+    let mesh_advertise_host = config.mesh_advertise_host.clone();
 
-    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let data_dir = config.data_dir.clone();
 
-    let node_id_str = std::env::var("NODE_ID").ok();
-    let node_id = node_id_str
-        .and_then(|s| Uuid::parse_str(&s).ok())
-        .unwrap_or_else(Uuid::new_v4);
+    let node_id = config.node_id.unwrap_or_else(Uuid::new_v4);
 
     // Node Discovery
-    let peer_discovery: Arc<dyn NodeDiscovery> = if let Ok(dns_query) = std::env::var("DNS_QUERY") {
+    let peer_discovery: Arc<dyn NodeDiscovery> = if let Some(dns_query) = config.dns_query {
         Arc::new(DnsNodeDiscovery::new(dns_query, mesh_port))
     } else {
         Arc::new(EnvironmentNodeDiscovery::new())
