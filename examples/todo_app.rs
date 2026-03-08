@@ -234,7 +234,11 @@ async fn delete_todo(
 // 7. Wiring
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting Distributed Todo App Node (TCP Mesh)...");
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    tracing::info!("Starting Distributed Todo App Node (TCP Mesh)...");
 
     let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
@@ -277,7 +281,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = format!("{}:{}", host, port);
     let mesh_addr = format!("{}:{}", host, mesh_port);
-    let mesh = Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
+    let mesh: Arc<TcpPubSub<TodoEvent>> = Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
 
     println!("Node ID:   {}", node_id);
     println!("API Listen: {}", listen_addr);
@@ -290,11 +294,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh_clone = mesh.clone();
     let bus_clone = bus.clone();
     tokio::spawn(async move {
-        let mut stream = mesh_clone.subscribe().await;
-        while let Some(item) = stream.next().await {
-            if let Ok(event) = item {
-                let _ = bus_clone.publish(event);
+        loop {
+            tracing::info!("Subscribing to mesh events...");
+            let mut stream = mesh_clone.subscribe().await;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(event) => {
+                        tracing::debug!("Mesh received event: {} for {}", event.payload.event_type(), event.aggregate_id);
+                        let _ = bus_clone.publish(event);
+                    }
+                    Err(e) => {
+                        tracing::error!("Error receiving from mesh: {}", e);
+                    }
+                }
             }
+            tracing::warn!("Mesh subscription stream ended. Restarting in 5 seconds...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
 

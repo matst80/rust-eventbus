@@ -29,6 +29,8 @@ spec:
           value: "3001"
         - name: DATA_DIR
           value: "/app/data"
+        - name: RUST_LOG
+          value: "rust_eventbus=debug,todo_app=info"
         - name: DNS_QUERY
           value: "todo-app-headless.default.svc.cluster.local"
         - name: NODE_ID

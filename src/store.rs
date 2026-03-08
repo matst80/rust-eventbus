@@ -96,6 +96,37 @@ struct FileInnerState {
 impl FileEventStore {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let file_path = path.as_ref().to_path_buf();
+        
+        // Scan the file to find the highest sequence number to initialize next_global_seq
+        let mut next_global_seq = 1;
+        if let Ok(file) = File::open(&file_path).await {
+            let mut reader = BufReader::new(file);
+            loop {
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf).await {
+                    Ok(_) => {
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut data = vec![0u8; len];
+                        if reader.read_exact(&mut data).await.is_ok() {
+                            // We don't need to full deserialize the whole Event, just peek the sequence if we wanted,
+                            // but for simplicity we deserialize here.
+                            // In a real system, we'd store the max seq in a header or footer.
+                            // Note: We use a dummy EventPayload type because we only care about the sequence field which is common.
+                            #[derive(Deserialize)]
+                            struct SeqPeek { global_sequence_num: u64 }
+                            if let Ok(peek) = bincode::deserialize::<SeqPeek>(&data) {
+                                if peek.global_sequence_num >= next_global_seq {
+                                    next_global_seq = peek.global_sequence_num + 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(StoreError::Io(e)),
+                }
+            }
+        }
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -105,15 +136,17 @@ impl FileEventStore {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
 
         // Spawn a background worker to handle file writes asynchronously.
-        // This decouples the append operation from disk I/O performance.
         tokio::spawn(async move {
             let mut file = file;
             while let Some(buffer) = rx.recv().await {
+                if buffer.is_empty() {
+                    let _ = file.sync_all().await;
+                    continue;
+                }
                 if let Err(e) = file.write_all(&buffer).await {
                     eprintln!("EventStore background writer failed: {}", e);
                     break;
                 }
-                // Optional: We could sync periodically here, but for now we let the OS buffer it for max speed.
             }
             let _ = file.sync_all().await;
         });
@@ -122,7 +155,7 @@ impl FileEventStore {
             file_path,
             inner: Arc::new(Mutex::new(FileInnerState {
                 tx,
-                next_global_seq: 1,
+                next_global_seq,
             })),
         })
     }
