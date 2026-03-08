@@ -15,10 +15,8 @@ use uuid::Uuid;
 
 use rust_eventbus::{
     bus::EventBus,
-    distributed::{
-        DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, LockError,
-        ProjectionLockManager, TcpPubSub,
-    },
+    cluster,
+    distributed::{DistributedPubSub, LockError, ProjectionLockManager, TcpPubSub},
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
     store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
@@ -143,147 +141,7 @@ impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
 }
 
 // 4. Distributed Implementations
-
-pub struct FileLeaseLockManager {
-    lock_dir: String,
-    lease_ttl: std::time::Duration,
-}
-
-impl FileLeaseLockManager {
-    pub fn new(lock_dir: String, lease_ttl: std::time::Duration) -> Self {
-        Self {
-            lock_dir,
-            lease_ttl,
-        }
-    }
-
-    fn lock_path(&self, projection_name: &str) -> String {
-        format!("{}/{}.lock", self.lock_dir, projection_name)
-    }
-
-    async fn read_owner(&self, lock_path: &str) -> Result<Option<Uuid>, LockError> {
-        match tokio::fs::read_to_string(lock_path).await {
-            Ok(content) => Ok(Uuid::parse_str(content.trim()).ok()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(LockError::Storage(e.to_string())),
-        }
-    }
-
-    async fn is_stale(&self, lock_path: &str) -> Result<bool, LockError> {
-        match tokio::fs::metadata(lock_path).await {
-            Ok(meta) => {
-                let modified = meta
-                    .modified()
-                    .map_err(|e| LockError::Storage(e.to_string()))?;
-                let age = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                Ok(age > self.lease_ttl)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(LockError::Storage(e.to_string())),
-        }
-    }
-
-    async fn write_owner(&self, lock_path: &str, node_id: &Uuid) -> Result<(), LockError> {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(lock_path)
-            .await
-            .map_err(|e| LockError::Storage(e.to_string()))?;
-
-        file.write_all(node_id.to_string().as_bytes())
-            .await
-            .map_err(|e| LockError::Storage(e.to_string()))
-    }
-}
-
-#[async_trait]
-impl ProjectionLockManager for FileLeaseLockManager {
-    async fn acquire_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<bool, LockError> {
-        tokio::fs::create_dir_all(&self.lock_dir)
-            .await
-            .map_err(|e| LockError::Storage(e.to_string()))?;
-
-        let lock_path = self.lock_path(projection_name);
-        match tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&lock_path)
-            .await
-        {
-            Ok(mut file) => {
-                file.write_all(node_id.to_string().as_bytes())
-                    .await
-                    .map_err(|e| LockError::Storage(e.to_string()))?;
-                return Ok(true);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(LockError::Storage(e.to_string())),
-        }
-
-        if let Some(owner) = self.read_owner(&lock_path).await? {
-            if owner == *node_id {
-                self.write_owner(&lock_path, node_id).await?;
-                return Ok(true);
-            }
-        }
-
-        if self.is_stale(&lock_path).await? {
-            if let Err(e) = tokio::fs::remove_file(&lock_path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(LockError::Storage(e.to_string()));
-                }
-            }
-
-            match tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&lock_path)
-                .await
-            {
-                Ok(mut file) => {
-                    file.write_all(node_id.to_string().as_bytes())
-                        .await
-                        .map_err(|e| LockError::Storage(e.to_string()))?;
-                    return Ok(true);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-                Err(e) => return Err(LockError::Storage(e.to_string())),
-            }
-        }
-
-        Ok(false)
-    }
-
-    async fn keep_alive(&self, projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
-        let lock_path = self.lock_path(projection_name);
-        match self.read_owner(&lock_path).await? {
-            Some(owner) if owner == *node_id => self.write_owner(&lock_path, node_id).await,
-            _ => Err(LockError::AlreadyHeld),
-        }
-    }
-
-    async fn release_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
-        let lock_path = self.lock_path(projection_name);
-        if let Some(owner) = self.read_owner(&lock_path).await? {
-            if owner != *node_id {
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-
-        if let Err(e) = tokio::fs::remove_file(lock_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(LockError::Storage(e.to_string()));
-            }
-        }
-        Ok(())
-    }
-}
+// Cluster helpers (discovery, mesh, lock manager, stores) are provided by `crate::cluster`.
 
 // 5. Shared Web State
 #[derive(Clone)]
@@ -441,43 +299,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
 
-    let node_id_str = std::env::var("NODE_ID").ok();
-    let node_id = node_id_str
-        .and_then(|s| Uuid::parse_str(&s).ok())
-        .unwrap_or_else(Uuid::new_v4);
-
-    // Node Discovery: Environment (Static) or DNS (Kubernetes Headless)
-    let peer_discovery: Arc<dyn rust_eventbus::distributed::NodeDiscovery> =
-        if let Ok(dns_query) = std::env::var("DNS_QUERY") {
-            println!(
-                "Discovery: DNS Query ({}) using mesh port {}",
-                dns_query, mesh_port
-            );
-            Arc::new(DnsNodeDiscovery::new(dns_query, mesh_port))
-        } else {
-            println!("Discovery: Environment (PEERS)");
-            Arc::new(EnvironmentNodeDiscovery::new())
-        };
-
-    let discovery_for_probe = peer_discovery.clone();
-
-    tokio::fs::create_dir_all(&data_dir).await?;
-
-    let event_store_path = format!("{}/todo_events.bin", data_dir);
-    let snapshot_store_path = format!("{}/todo_snapshots", data_dir);
-
-    let event_store = Arc::new(FileEventStore::new(&event_store_path).await?);
-    let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_store_path).await?);
+    let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>().await?;
+    let node_id = cluster.node_id;
+    let event_store = cluster.event_store.clone();
+    let snapshot_store = cluster.snapshot_store.clone();
+    let mesh = cluster.mesh.clone();
+    let lock_manager = cluster.lock_manager.clone();
+    let mesh_bind_addr = cluster.mesh_bind_addr.clone();
+    let mesh_advertised_addr = cluster.mesh_advertised_addr.clone();
+    let discovery_for_probe = cluster.discovery.clone();
+    let data_dir = cluster.data_dir.clone();
 
     let listen_addr = format!("{}:{}", host, port);
-    let mesh_bind_addr = format!("{}:{}", mesh_bind_host, mesh_port);
-    let mesh_advertised_addr = format!("{}:{}", mesh_advertise_host, mesh_port);
-    let mesh: Arc<TcpPubSub<TodoEvent>> = Arc::new(TcpPubSub::new_with_advertised_addr(
-        node_id,
-        mesh_bind_addr.clone(),
-        mesh_advertised_addr.clone(),
-        peer_discovery,
-    ));
 
     tracing::info!("***************************************************");
     tracing::info!("Starting Node ID: {}", node_id);
@@ -488,12 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("***************************************************");
 
     let bus = EventBus::<TodoEvent>::new(1024);
-    let lock_dir = format!("{}/locks", data_dir);
-    let lock_manager = Arc::new(FileLeaseLockManager::new(
-        lock_dir,
-        std::time::Duration::from_secs(15),
-    ));
-    let projection_version = Arc::new(AtomicU64::new(0));
+    let projection_version = cluster.projection_version.clone();
 
     let ephemeral_actor = EphemeralProjectionActor::new(
         bus.clone(),
