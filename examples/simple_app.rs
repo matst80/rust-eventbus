@@ -135,8 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Cleanup generated files for example cleanliness (optional)
-    let _ = tokio::fs::remove_file("events.bin").await;
-    let _ = tokio::fs::remove_dir_all("snapshots").await;
+    //let _ = tokio::fs::remove_file("events.bin").await;
+    //let _ = tokio::fs::remove_dir_all("snapshots").await;
 
     println!("Example complete safely!");
     Ok(())

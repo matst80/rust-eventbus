@@ -7,7 +7,6 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
 
 use crate::{Event, EventPayload};
 
@@ -51,17 +50,19 @@ where
     ) -> Result<(), StoreError>;
 }
 
+use tokio::sync::{mpsc, Mutex};
+
 /// A simple file-based, append-only EventStore implementation using raw bincode binary sequences.
 #[derive(Clone)]
 pub struct FileEventStore {
     file_path: PathBuf,
     // A mutex ensures append operations from multiple tasks do not interleave bytes and handles seq.
-    inner: Arc<Mutex<FileInner>>,
+    inner: Arc<Mutex<FileInnerState>>,
 }
 
-struct FileInner {
-    file: File,
+struct FileInnerState {
     next_global_seq: u64,
+    tx: mpsc::Sender<Vec<u8>>,
 }
 
 impl FileEventStore {
@@ -73,12 +74,26 @@ impl FileEventStore {
             .open(&file_path)
             .await?;
 
-        // Simplified: Start from 1 for now. 
-        // In a real system, you'd scan for the last known global_seq or store it in a header.
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+
+        // Spawn a background worker to handle file writes asynchronously.
+        // This decouples the append operation from disk I/O performance.
+        tokio::spawn(async move {
+            let mut file = file;
+            while let Some(buffer) = rx.recv().await {
+                if let Err(e) = file.write_all(&buffer).await {
+                    eprintln!("EventStore background writer failed: {}", e);
+                    break;
+                }
+                // Optional: We could sync periodically here, but for now we let the OS buffer it for max speed.
+            }
+            let _ = file.sync_all().await;
+        });
+
         Ok(Self {
             file_path,
-            inner: Arc::new(Mutex::new(FileInner {
-                file,
+            inner: Arc::new(Mutex::new(FileInnerState {
+                tx,
                 next_global_seq: 1,
             })),
         })
@@ -92,7 +107,7 @@ where
 {
     async fn append(&self, mut events: Vec<Event<E>>) -> Result<Vec<Event<E>>, StoreError> {
         let mut buffer = Vec::new();
-        
+
         let mut inner = self.inner.lock().await;
         for event in &mut events {
             event.global_sequence_num = inner.next_global_seq;
@@ -103,9 +118,13 @@ where
             buffer.extend_from_slice(&len.to_le_bytes());
             buffer.extend_from_slice(&bytes);
         }
-        
-        inner.file.write_all(&buffer).await?;
-        inner.file.sync_data().await?;
+
+        inner
+            .tx
+            .send(buffer)
+            .await
+            .map_err(|_| StoreError::Other("Background writer closed".into()))?;
+
         Ok(events)
     }
 

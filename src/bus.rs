@@ -67,7 +67,6 @@ impl<T: EventPayload> EventBus<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

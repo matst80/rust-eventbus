@@ -64,6 +64,12 @@ where
         }
     }
 
+    /// Returns a reference-counted lock to the underlying projection state.
+    /// This is useful for web servers or APIs to query the current read model.
+    pub fn get_state(&self) -> Arc<Mutex<S>> {
+        self.state.clone()
+    }
+
     /// Spawns the projection actor loop into the tokio runtime.
     /// This resolves the massive `Mutex` contention issue from the Go version by isolating
     /// each projection to its own concurrent task loop.
