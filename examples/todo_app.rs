@@ -7,6 +7,7 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -157,15 +158,31 @@ struct AppState {
     mesh: Arc<TcpPubSub<TodoEvent>>,
     event_store: Arc<FileEventStore>,
     projection_state: Arc<tokio::sync::Mutex<TodoState>>,
+    projection_version: Arc<AtomicU64>,
 }
 
 // 6. Define API Handlers
 
-async fn get_todos(State(state): State<AppState>) -> Json<Vec<TodoItem>> {
+async fn get_todos(
+    State(state): State<AppState>,
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<(axum::http::HeaderMap, Json<Vec<TodoItem>>), StatusCode> {
+    let version = state.projection_version.load(Ordering::Relaxed);
+    let etag = format!("\"{}\"", version);
+
     let proj = state.projection_state.lock().await;
-    let mut todos: Vec<TodoItem> = proj.todos.values().cloned().collect();
-    todos.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(todos)
+    let todos: Vec<TodoItem> = proj.todos.values().cloned().collect();
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+
+    if let Some(if_none_match) = request.headers().get(axum::http::header::IF_NONE_MATCH) {
+        if if_none_match.to_str().map_or(false, |v| v == etag) {
+            return Ok((headers, Json(todos)));
+        }
+    }
+
+    Ok((headers, Json(todos)))
 }
 
 #[derive(Deserialize)]
@@ -324,39 +341,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bus = EventBus::<TodoEvent>::new(1024);
     let mock_lock_manager = Arc::new(MockLockManager);
-
-    let mesh_clone = mesh.clone();
-    let bus_clone = bus.clone();
-    tokio::spawn(async move {
-        loop {
-            tracing::info!("Subscribing to mesh events...");
-            let mut stream = mesh_clone.subscribe().await;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(event) => {
-                        tracing::debug!(
-                            "Mesh received event: {} for {}",
-                            event.payload.event_type(),
-                            event.aggregate_id
-                        );
-                        let _ = bus_clone.publish(event);
-                    }
-                    Err(e) => {
-                        tracing::error!("Error receiving from mesh: {}", e);
-                    }
-                }
-            }
-            tracing::warn!("Mesh subscription stream ended. Restarting in 5 seconds...");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
+    let projection_version = Arc::new(AtomicU64::new(0));
 
     let ephemeral_actor = EphemeralProjectionActor::new(
         bus.clone(),
         event_store.clone(),
         Arc::new(TodoProjection),
         snapshot_store.clone(),
-    );
+    )
+    .with_version(projection_version.clone());
     let projection_state = ephemeral_actor.get_state();
     tokio::spawn(ephemeral_actor.spawn());
 
@@ -376,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mesh,
         event_store,
         projection_state,
+        projection_version,
     };
 
     let app = Router::new()

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -74,6 +75,7 @@ pub struct EphemeralProjectionActor<E: EventPayload, S, P, SS, ES> {
     cmd_tx: watch::Sender<ProjectionCommand>,
     cmd_rx: watch::Receiver<ProjectionCommand>,
     _marker: std::marker::PhantomData<E>,
+    version: Option<Arc<AtomicU64>>,
 }
 
 impl<E, S, P, SS, ES> EphemeralProjectionActor<E, S, P, SS, ES>
@@ -101,12 +103,19 @@ where
             cmd_tx,
             cmd_rx,
             _marker: std::marker::PhantomData,
+            version: None,
         }
     }
 
     /// Set how often to persist snapshots (every N events). Default is 1.
     pub fn with_snapshot_interval(mut self, interval: u64) -> Self {
         self.snapshot_interval = interval.max(1);
+        self
+    }
+
+    /// Set a version counter to track projection changes (for ETag support).
+    pub fn with_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.version = Some(version);
         self
     }
 
@@ -176,6 +185,9 @@ where
                     if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
                         current_seq = event.global_sequence_num;
                         events_since_snapshot += 1;
+                        if let Some(v) = &self.version {
+                            v.fetch_add(1, Ordering::Relaxed);
+                        }
                         if events_since_snapshot >= self.snapshot_interval {
                             events_since_snapshot = 0;
                             if let Err(e) = self
@@ -226,6 +238,9 @@ where
                                         Ok(()) => {
                                             current_seq = event.global_sequence_num;
                                             events_since_snapshot += 1;
+                                            if let Some(v) = &self.version {
+                                                v.fetch_add(1, Ordering::Relaxed);
+                                            }
                                             if events_since_snapshot >= self.snapshot_interval {
                                                 events_since_snapshot = 0;
                                                 if let Err(e) = self.snapshot_store
@@ -271,6 +286,7 @@ pub struct DurableProjectionActor<E: EventPayload, S, P, SS, ES, LM> {
     cmd_tx: watch::Sender<ProjectionCommand>,
     cmd_rx: watch::Receiver<ProjectionCommand>,
     _marker: std::marker::PhantomData<E>,
+    version: Option<Arc<AtomicU64>>,
 }
 
 impl<E, S, P, SS, ES, LM> DurableProjectionActor<E, S, P, SS, ES, LM>
@@ -303,11 +319,17 @@ where
             cmd_tx,
             cmd_rx,
             _marker: std::marker::PhantomData,
+            version: None,
         }
     }
 
     pub fn with_snapshot_interval(mut self, interval: u64) -> Self {
         self.snapshot_interval = interval.max(1);
+        self
+    }
+
+    pub fn with_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.version = Some(version);
         self
     }
 
@@ -371,6 +393,9 @@ where
                         if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
                             current_seq = event.global_sequence_num;
                             events_since_snapshot += 1;
+                            if let Some(v) = &self.version {
+                                v.fetch_add(1, Ordering::Relaxed);
+                            }
                             if events_since_snapshot >= self.snapshot_interval {
                                 events_since_snapshot = 0;
                                 let _ = self
@@ -420,6 +445,9 @@ where
                                         if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
                                             current_seq = event.global_sequence_num;
                                             events_since_snapshot += 1;
+                                            if let Some(v) = &self.version {
+                                                v.fetch_add(1, Ordering::Relaxed);
+                                            }
                                             if events_since_snapshot >= self.snapshot_interval {
                                                 events_since_snapshot = 0;
                                                 let _ = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await;
