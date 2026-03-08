@@ -281,7 +281,7 @@ where
 
 /// Orchestrates a durable projection (e.g., shared relational database, robust read-model).
 /// Only ONE node holding the lock will actively process events.
-pub struct DurableProjectionActor<E: EventPayload, S, P, SS, ES, LM> {
+pub struct DurableProjectionActor<E: EventPayload, S, P, SS, ES, LM: ?Sized> {
     bus: EventBus<E>,
     event_store: Arc<ES>,
     projection: Arc<P>,
@@ -303,7 +303,7 @@ where
     P: Projection<E, S>,
     SS: SnapshotStore<S>,
     ES: EventStore<E>,
-    LM: ProjectionLockManager,
+    LM: ProjectionLockManager + ?Sized,
 {
     pub fn new(
         bus: EventBus<E>,
