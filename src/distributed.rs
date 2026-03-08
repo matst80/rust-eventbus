@@ -51,6 +51,39 @@ impl BackendPubSub {
     }
 }
 
+/// Factory that returns the default mesh implementation as a trait object.
+/// By default this returns the `TcpPubSub` implementation. Enabling the
+/// `libp2p-backend` feature will switch to the libp2p adapter if available.
+pub fn default_mesh<E>(
+    node_id: Uuid,
+    listen_addr: String,
+    advertised_addr: String,
+    discovery: std::sync::Arc<dyn NodeDiscovery>,
+) -> std::sync::Arc<dyn DistributedPubSub<E>>
+where
+    E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
+{
+    #[cfg(feature = "libp2p-backend")]
+    {
+        // When the feature is enabled we prefer the libp2p adapter. The adapter
+        // is expected to implement `DistributedPubSub<E>`.
+        return std::sync::Arc::new(crate::libp2p_adapter::Libp2pAdapter::new_with_addrs(
+            node_id,
+            listen_addr,
+            advertised_addr,
+            discovery,
+        ));
+    }
+
+    // Default: TcpPubSub
+    std::sync::Arc::new(TcpPubSub::new_with_advertised_addr(
+        node_id,
+        listen_addr,
+        advertised_addr,
+        discovery,
+    ))
+}
+
 #[async_trait]
 impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E>
     for BackendPubSub
@@ -431,7 +464,7 @@ impl PubSubBackend for TcpPubSubBackend {
 
             loop {
                 match listener.accept().await {
-                    Ok((mut socket, peer_addr)) => {
+                    Ok((mut socket, _peer_addr)) => {
                         let tx = tx.clone();
                         let my_node_id = my_node_id;
                         tokio::spawn(async move {

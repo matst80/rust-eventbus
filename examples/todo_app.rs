@@ -9,17 +9,15 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
 use rust_eventbus::{
     bus::EventBus,
-    cluster,
-    distributed::{DistributedPubSub, LockError, ProjectionLockManager, TcpPubSub},
+    distributed::{DistributedPubSub},
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
-    store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
+    store::{CompactionRule, EventStore, FileEventStore},
 };
 
 fn same_endpoint(a: &str, b: &str) -> bool {
@@ -148,7 +146,7 @@ impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
 struct AppState {
     node_id: Uuid,
     bus: EventBus<TodoEvent>,
-    mesh: Arc<TcpPubSub<TodoEvent>>,
+    mesh: Arc<dyn DistributedPubSub<TodoEvent>>,
     event_store: Arc<FileEventStore>,
     projection_state: Arc<tokio::sync::Mutex<TodoState>>,
     projection_version: Arc<AtomicU64>,
@@ -285,19 +283,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("PORT must be a number");
 
-    let mesh_port: u16 = std::env::var("MESH_PORT")
+    let _mesh_port: u16 = std::env::var("MESH_PORT")
         .unwrap_or_else(|_| "3001".to_string())
         .parse()
         .expect("MESH_PORT must be a number");
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let mesh_bind_host = std::env::var("MESH_BIND_HOST").unwrap_or_else(|_| host.clone());
-    let mesh_advertise_host = std::env::var("MESH_ADVERTISE_HOST")
+    let _mesh_advertise_host = std::env::var("MESH_ADVERTISE_HOST")
         .ok()
         .or_else(|| std::env::var("POD_IP").ok())
         .unwrap_or_else(|| mesh_bind_host.clone());
 
-    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    let _data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
 
     let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>().await?;
     let node_id = cluster.node_id;

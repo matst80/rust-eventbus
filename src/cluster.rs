@@ -1,4 +1,4 @@
-use crate::distributed::{DnsNodeDiscovery, EnvironmentNodeDiscovery, NodeDiscovery, ProjectionLockManager, TcpPubSub};
+use crate::distributed::{DnsNodeDiscovery, EnvironmentNodeDiscovery, NodeDiscovery, ProjectionLockManager, DistributedPubSub};
 use crate::store::{FileEventStore, FileSnapshotStore};
 use crate::event::EventPayload;
 use std::sync::Arc;
@@ -147,7 +147,7 @@ impl ProjectionLockManager for FileLeaseLockManager {
 /// Aggregate of components needed to wire an application node.
 pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> {
     pub node_id: Uuid,
-    pub mesh: Arc<TcpPubSub<E>>,
+    pub mesh: Arc<dyn DistributedPubSub<E>>,
     pub event_store: Arc<FileEventStore>,
     pub snapshot_store: Arc<FileSnapshotStore>,
     pub lock_manager: Arc<dyn ProjectionLockManager>,
@@ -162,7 +162,7 @@ pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde
 pub async fn init_cluster<
     E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>,
 >() -> Result<ClusterComponents<E>, Box<dyn Error>> {
-    let port: u16 = std::env::var("PORT")
+    let _port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
         .expect("PORT must be a number");
@@ -204,12 +204,12 @@ pub async fn init_cluster<
     let mesh_bind_addr = format!("{}:{}", mesh_bind_host, mesh_port);
     let mesh_advertised_addr = format!("{}:{}", mesh_advertise_host, mesh_port);
 
-    let mesh: Arc<TcpPubSub<E>> = Arc::new(TcpPubSub::new_with_advertised_addr(
+    let mesh: Arc<dyn DistributedPubSub<E>> = crate::distributed::default_mesh(
         node_id,
         mesh_bind_addr.clone(),
         mesh_advertised_addr.clone(),
         peer_discovery.clone(),
-    ));
+    );
 
     let lock_dir = format!("{}/locks", data_dir);
     let lock_manager = Arc::new(FileLeaseLockManager::new(
