@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use async_trait::async_trait;
 use futures::stream::{unfold, BoxStream, StreamExt};
@@ -91,14 +92,17 @@ pub struct FileEventStore {
 struct FileInnerState {
     next_global_seq: u64,
     tx: mpsc::Sender<Vec<u8>>,
+    /// In-memory index of event id -> global_sequence_num to provide idempotent appends.
+    id_index: HashMap<Uuid, u64>,
 }
 
 impl FileEventStore {
     pub async fn new(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let file_path = path.as_ref().to_path_buf();
 
-        // Scan the file to find the highest sequence number to initialize next_global_seq
-        let mut next_global_seq = 1;
+        // Scan the file to find the highest sequence number and build an id -> seq index
+        let mut next_global_seq = 1u64;
+        let mut id_index: HashMap<Uuid, u64> = HashMap::new();
         if let Ok(file) = File::open(&file_path).await {
             let mut reader = BufReader::new(file);
             loop {
@@ -108,18 +112,16 @@ impl FileEventStore {
                         let len = u32::from_le_bytes(len_buf) as usize;
                         let mut data = vec![0u8; len];
                         if reader.read_exact(&mut data).await.is_ok() {
-                            // We don't need to full deserialize the whole Event, just peek the sequence if we wanted,
-                            // but for simplicity we deserialize here.
-                            // In a real system, we'd store the max seq in a header or footer.
-                            // Note: We use a dummy EventPayload type because we only care about the sequence field which is common.
                             #[derive(Deserialize)]
-                            struct SeqPeek {
+                            struct IdSeqPeek {
+                                id: Uuid,
                                 global_sequence_num: u64,
                             }
-                            if let Ok(peek) = bincode::deserialize::<SeqPeek>(&data) {
+                            if let Ok(peek) = bincode::deserialize::<IdSeqPeek>(&data) {
                                 if peek.global_sequence_num >= next_global_seq {
                                     next_global_seq = peek.global_sequence_num + 1;
                                 }
+                                id_index.insert(peek.id, peek.global_sequence_num);
                             }
                         }
                     }
@@ -175,6 +177,7 @@ impl FileEventStore {
             inner: Arc::new(Mutex::new(FileInnerState {
                 tx,
                 next_global_seq,
+                id_index,
             })),
         })
     }
@@ -232,9 +235,17 @@ where
         let mut buffer = Vec::new();
 
         let mut inner = self.inner.lock().await;
+
         for event in &mut events {
+            // Idempotency: if we already saw this event id, return the known global_sequence_num
+            if let Some(existing_seq) = inner.id_index.get(&event.id) {
+                event.global_sequence_num = *existing_seq;
+                continue; // skip writing duplicate
+            }
+
             event.global_sequence_num = inner.next_global_seq;
             inner.next_global_seq += 1;
+            inner.id_index.insert(event.id, event.global_sequence_num);
 
             let bytes = bincode::serialize(&event)?;
             let len = bytes.len() as u32;
@@ -242,11 +253,15 @@ where
             buffer.extend_from_slice(&bytes);
         }
 
-        inner
-            .tx
-            .send(buffer)
-            .await
-            .map_err(|_| StoreError::Other("Background writer closed".into()))?;
+        // Only send a write if there's new data to persist. Always send a flush sentinel
+        // to ensure durability ordering for callers.
+        if !buffer.is_empty() {
+            inner
+                .tx
+                .send(buffer)
+                .await
+                .map_err(|_| StoreError::Other("Background writer closed".into()))?;
+        }
 
         // Flush to ensure data is available for reads immediately after append.
         inner.tx.send(vec![]).await.ok(); // no-op flush sentinel; harmless if writer is gone

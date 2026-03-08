@@ -24,6 +24,20 @@ use rust_eventbus::{
     store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
 };
 
+fn same_endpoint(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+
+    match (
+        a.parse::<std::net::SocketAddr>(),
+        b.parse::<std::net::SocketAddr>(),
+    ) {
+        (Ok(lhs), Ok(rhs)) => lhs.ip() == rhs.ip() && lhs.port() == rhs.port(),
+        _ => false,
+    }
+}
+
 // 1. Define Domain Events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TodoEvent {
@@ -419,6 +433,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("MESH_PORT must be a number");
 
     let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let mesh_bind_host = std::env::var("MESH_BIND_HOST").unwrap_or_else(|_| host.clone());
+    let mesh_advertise_host = std::env::var("MESH_ADVERTISE_HOST")
+        .ok()
+        .or_else(|| std::env::var("POD_IP").ok())
+        .unwrap_or_else(|| mesh_bind_host.clone());
 
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
 
@@ -451,14 +470,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_store_path).await?);
 
     let listen_addr = format!("{}:{}", host, port);
-    let mesh_addr = format!("{}:{}", host, mesh_port);
-    let mesh: Arc<TcpPubSub<TodoEvent>> =
-        Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
+    let mesh_bind_addr = format!("{}:{}", mesh_bind_host, mesh_port);
+    let mesh_advertised_addr = format!("{}:{}", mesh_advertise_host, mesh_port);
+    let mesh: Arc<TcpPubSub<TodoEvent>> = Arc::new(TcpPubSub::new_with_advertised_addr(
+        node_id,
+        mesh_bind_addr.clone(),
+        mesh_advertised_addr.clone(),
+        peer_discovery,
+    ));
 
     tracing::info!("***************************************************");
     tracing::info!("Starting Node ID: {}", node_id);
     tracing::info!("API Listen:      {}", listen_addr);
-    tracing::info!("Mesh Listen:     {}", mesh_addr);
+    tracing::info!("Mesh Listen:     {}", mesh_bind_addr);
+    tracing::info!("Mesh Advertise:  {}", mesh_advertised_addr);
     tracing::info!("Storage:         {}", data_dir);
     tracing::info!("***************************************************");
 
@@ -490,12 +515,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tokio::spawn(durable_actor.spawn());
 
-    let self_mesh_addr = mesh_addr.clone();
+    let self_mesh_addr = mesh_advertised_addr.clone();
     tokio::spawn(async move {
         loop {
             match discovery_for_probe.discover_nodes().await {
                 Ok(nodes) => {
-                    let peer_count = nodes.iter().filter(|n| n.address != self_mesh_addr).count();
+                    let peer_count = nodes
+                        .iter()
+                        .filter(|n| !same_endpoint(&n.address, &self_mesh_addr))
+                        .count();
                     tracing::info!("Discovery probe: {} peer(s) visible", peer_count);
                 }
                 Err(e) => tracing::warn!("Discovery probe failed: {}", e),
@@ -516,12 +544,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mesh_for_subscribe = app_state.mesh.clone();
     let bus_for_mesh = app_state.bus.clone();
+    let event_store_for_mesh = app_state.event_store.clone();
     tokio::spawn(async move {
         let mut incoming = mesh_for_subscribe.subscribe().await;
         while let Some(result) = incoming.next().await {
             match result {
                 Ok(event) => {
-                    let _ = bus_for_mesh.publish(event);
+                    // Persist the remote event into the local EventStore so the local
+                    // projections can rely on a monotonic, local `global_sequence_num`.
+                    // Do NOT re-publish to the mesh here to avoid loops.
+                    match event_store_for_mesh.append(vec![event.clone()]).await {
+                        Ok(stored) => {
+                            for e in stored {
+                                let _ = bus_for_mesh.publish(e);
+                            }
+                        }
+                        Err(e) => tracing::warn!("Failed to persist mesh event: {}", e),
+                    }
                 }
                 Err(e) => tracing::warn!("Mesh subscribe error: {}", e),
             }

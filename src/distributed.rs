@@ -153,12 +153,17 @@ impl NodeDiscovery for DnsNodeDiscovery {
         let query = format!("{}:{}", self.service_name, self.port);
         match lookup_host(query.clone()).await {
             Ok(addrs) => {
-                let nodes: Vec<Node> = addrs
-                    .map(|addr| Node {
-                        id: Uuid::nil(),
-                        address: addr.to_string(),
-                    })
-                    .collect();
+                let mut seen = std::collections::HashSet::new();
+                let mut nodes = Vec::new();
+                for addr in addrs {
+                    let addr = addr.to_string();
+                    if seen.insert(addr.clone()) {
+                        nodes.push(Node {
+                            id: Uuid::nil(),
+                            address: addr,
+                        });
+                    }
+                }
 
                 if nodes.is_empty() {
                     tracing::warn!("DNS discovery for {} returned no addresses", query);
@@ -188,6 +193,7 @@ impl NodeDiscovery for DnsNodeDiscovery {
 pub struct TcpPubSub<E: EventPayload> {
     node_id: Uuid,
     listen_addr: String,
+    advertised_addr: String,
     discovery: Arc<dyn NodeDiscovery>,
     discovery_cache: Arc<parking_lot::Mutex<(std::time::Instant, Vec<Node>)>>,
     connections: Arc<Mutex<HashMap<String, tokio::net::TcpStream>>>,
@@ -196,9 +202,19 @@ pub struct TcpPubSub<E: EventPayload> {
 
 impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpPubSub<E> {
     pub fn new(node_id: Uuid, listen_addr: String, discovery: Arc<dyn NodeDiscovery>) -> Self {
+        Self::new_with_advertised_addr(node_id, listen_addr.clone(), listen_addr, discovery)
+    }
+
+    pub fn new_with_advertised_addr(
+        node_id: Uuid,
+        listen_addr: String,
+        advertised_addr: String,
+        discovery: Arc<dyn NodeDiscovery>,
+    ) -> Self {
         Self {
             node_id,
             listen_addr,
+            advertised_addr,
             discovery,
             discovery_cache: Arc::new(parking_lot::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
@@ -207,6 +223,20 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
             connections: Arc::new(Mutex::new(HashMap::new())),
             _phantom: std::marker::PhantomData,
         }
+    }
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+
+    match (
+        a.parse::<std::net::SocketAddr>(),
+        b.parse::<std::net::SocketAddr>(),
+    ) {
+        (Ok(lhs), Ok(rhs)) => lhs.ip() == rhs.ip() && lhs.port() == rhs.port(),
+        _ => false,
     }
 }
 
@@ -233,10 +263,10 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             n
         };
 
-        let my_addr = self.listen_addr.clone();
+        let my_addr = self.advertised_addr.clone();
         let active_peer_addrs: std::collections::HashSet<String> = nodes
             .iter()
-            .filter(|n| n.address != my_addr)
+            .filter(|n| !same_endpoint(&n.address, &my_addr))
             .map(|n| n.address.clone())
             .collect();
 
@@ -261,7 +291,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
 
         for node in nodes {
             // Self-filter check (ip-based as fallback for nil-id discovery)
-            if node.address == my_addr {
+            if same_endpoint(&node.address, &my_addr) {
                 continue;
             }
 

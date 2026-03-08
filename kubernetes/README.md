@@ -36,6 +36,8 @@ The application handles the following environment variables:
 |----------|-------------|---------|
 | `PORT` | The port the API server listens on | `3000` |
 | `HOST` | The host interface to bind to | `0.0.0.0` |
+| `MESH_BIND_HOST` | Host/interface to bind the mesh listener | `HOST` |
+| `MESH_ADVERTISE_HOST` | Address advertised for mesh self-filtering | `POD_IP`/`MESH_BIND_HOST` |
 | `DATA_DIR` | Directory for event and snapshot storage | `./data` |
 | `NODE_ID` | Unique identifier for the node (UUID) | Auto-generated |
 

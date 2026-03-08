@@ -27,6 +27,14 @@ spec:
           value: "3000"
         - name: HOST
           value: "0.0.0.0"
+        - name: MESH_BIND_HOST
+          value: "0.0.0.0"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: MESH_ADVERTISE_HOST
+          value: "$(POD_IP)"
         - name: MESH_PORT
           value: "3001"
         - name: DATA_DIR
