@@ -13,7 +13,10 @@ use uuid::Uuid;
 
 use rust_eventbus::{
     bus::EventBus,
-    distributed::{DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, LockError, ProjectionLockManager, TcpPubSub},
+    distributed::{
+        DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, LockError,
+        ProjectionLockManager, TcpPubSub,
+    },
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
     store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
@@ -68,7 +71,7 @@ impl Projection<TodoEvent, TodoState> for TodoProjection {
         event: &Event<TodoEvent>,
     ) -> Result<(), ProjectionError> {
         let aggregate_id = event.aggregate_id.clone();
-        
+
         match &event.payload {
             TodoEvent::TodoCreated { title } => {
                 state.todos.insert(
@@ -114,7 +117,10 @@ impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
     ) -> Result<(), ProjectionError> {
         if let TodoEvent::TodoCreated { title } = &event.payload {
             state.count += 1;
-            println!("📧 [DURABLE PROJECTION] Sending welcome email for Todo: '{}' (Total emails: {})", title, state.count);
+            println!(
+                "📧 [DURABLE PROJECTION] Sending welcome email for Todo: '{}' (Total emails: {})",
+                title, state.count
+            );
         }
         Ok(())
     }
@@ -126,7 +132,11 @@ pub struct MockLockManager;
 
 #[async_trait]
 impl ProjectionLockManager for MockLockManager {
-    async fn acquire_lock(&self, _projection_name: &str, _node_id: &Uuid) -> Result<bool, LockError> {
+    async fn acquire_lock(
+        &self,
+        _projection_name: &str,
+        _node_id: &Uuid,
+    ) -> Result<bool, LockError> {
         Ok(true)
     }
 
@@ -154,7 +164,7 @@ struct AppState {
 async fn get_todos(State(state): State<AppState>) -> Json<Vec<TodoItem>> {
     let proj = state.projection_state.lock().await;
     let mut todos: Vec<TodoItem> = proj.todos.values().cloned().collect();
-    todos.sort_by(|a, b| a.id.cmp(&b.id)); 
+    todos.sort_by(|a, b| a.id.cmp(&b.id));
     Json(todos)
 }
 
@@ -167,26 +177,35 @@ async fn create_todo(
     State(state): State<AppState>,
     Json(req): Json<CreateTodoRequest>,
 ) -> Result<Json<TodoItem>, StatusCode> {
-    println!("Node {} handling create_todo for: {}", state.node_id, req.title);
+    println!(
+        "Node {} handling create_todo for: {}",
+        state.node_id, req.title
+    );
     let aggregate_id = Uuid::new_v4().to_string();
-    let event = Event::new(&aggregate_id, 1, TodoEvent::TodoCreated { title: req.title.clone() });
-    
+    let event = Event::new(
+        &aggregate_id,
+        1,
+        TodoEvent::TodoCreated {
+            title: req.title.clone(),
+        },
+    );
+
     let stored = state.event_store.append(vec![event]).await.map_err(|e| {
         eprintln!("Store error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    
+
     for e in stored {
         let _ = state.bus.publish(e.clone());
         let _ = state.mesh.publish(&e).await;
     }
-    
+
     let item = TodoItem {
         id: aggregate_id,
         title: req.title,
         completed: false,
     };
-    
+
     Ok(Json(item))
 }
 
@@ -195,13 +214,17 @@ async fn complete_todo(
     State(state): State<AppState>,
 ) -> Result<StatusCode, StatusCode> {
     let event = Event::new(&id, 2, TodoEvent::TodoCompleted);
-    
-    let stored = state.event_store.append(vec![event]).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let stored = state
+        .event_store
+        .append(vec![event])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     for e in stored {
         let _ = state.bus.publish(e.clone());
         let _ = state.mesh.publish(&e).await;
     }
-    
+
     Ok(StatusCode::OK)
 }
 
@@ -210,14 +233,21 @@ async fn delete_todo(
     State(state): State<AppState>,
 ) -> Result<StatusCode, StatusCode> {
     let event = Event::new(&id, 3, TodoEvent::TodoDeleted);
-    
-    let stored = state.event_store.append(vec![event]).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
+    let stored = state
+        .event_store
+        .append(vec![event])
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
     let es = state.event_store.clone();
     tokio::spawn(async move {
         let rule = CompactionRule::PruneIf(|payload| matches!(payload, TodoEvent::TodoDeleted));
         match EventStore::<TodoEvent>::compact(es.as_ref(), rule).await {
-            Ok(removed) if removed > 0 => println!("🧹 [LOG COMPACTION] Removed {} stale events from log", removed),
+            Ok(removed) if removed > 0 => println!(
+                "🧹 [LOG COMPACTION] Removed {} stale events from log",
+                removed
+            ),
             Err(e) => eprintln!("❌ Log compaction failed: {}", e),
             _ => (),
         }
@@ -227,7 +257,7 @@ async fn delete_todo(
         let _ = state.bus.publish(e.clone());
         let _ = state.mesh.publish(&e).await;
     }
-    
+
     Ok(StatusCode::OK)
 }
 
@@ -244,27 +274,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "3000".to_string())
         .parse()
         .expect("PORT must be a number");
-    
+
     let mesh_port: u16 = std::env::var("MESH_PORT")
         .unwrap_or_else(|_| "3001".to_string())
         .parse()
         .expect("MESH_PORT must be a number");
-    
-    let host = std::env::var("HOST")
-        .unwrap_or_else(|_| "0.0.0.0".to_string());
 
-    let data_dir = std::env::var("DATA_DIR")
-        .unwrap_or_else(|_| "./data".to_string());
-    
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+
     let node_id_str = std::env::var("NODE_ID").ok();
     let node_id = node_id_str
         .and_then(|s| Uuid::parse_str(&s).ok())
         .unwrap_or_else(Uuid::new_v4);
 
     // Node Discovery: Environment (Static) or DNS (Kubernetes Headless)
-    let peer_discovery: Arc<dyn rust_eventbus::distributed::NodeDiscovery> = 
+    let peer_discovery: Arc<dyn rust_eventbus::distributed::NodeDiscovery> =
         if let Ok(dns_query) = std::env::var("DNS_QUERY") {
-            println!("Discovery: DNS Query ({}) using mesh port {}", dns_query, mesh_port);
+            println!(
+                "Discovery: DNS Query ({}) using mesh port {}",
+                dns_query, mesh_port
+            );
             Arc::new(DnsNodeDiscovery::new(dns_query, mesh_port))
         } else {
             println!("Discovery: Environment (PEERS)");
@@ -281,7 +312,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = format!("{}:{}", host, port);
     let mesh_addr = format!("{}:{}", host, mesh_port);
-    let mesh: Arc<TcpPubSub<TodoEvent>> = Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
+    let mesh: Arc<TcpPubSub<TodoEvent>> =
+        Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
 
     tracing::info!("***************************************************");
     tracing::info!("Starting Node ID: {}", node_id);
@@ -302,7 +334,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(item) = stream.next().await {
                 match item {
                     Ok(event) => {
-                        tracing::debug!("Mesh received event: {} for {}", event.payload.event_type(), event.aggregate_id);
+                        tracing::debug!(
+                            "Mesh received event: {} for {}",
+                            event.payload.event_type(),
+                            event.aggregate_id
+                        );
                         let _ = bus_clone.publish(event);
                     }
                     Err(e) => {
@@ -350,11 +386,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr: SocketAddr = listen_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
-    
+
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to install SIGTERM handler");
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("Received SIGINT, shutting down...");

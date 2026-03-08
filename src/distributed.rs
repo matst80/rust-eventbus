@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use thiserror::Error;
 use uuid::Uuid;
 
 use crate::event::{Event, EventPayload};
@@ -113,10 +113,14 @@ impl EnvironmentNodeDiscovery {
 #[async_trait]
 impl NodeDiscovery for EnvironmentNodeDiscovery {
     async fn discover_nodes(&self) -> Result<Vec<Node>, DistributedError> {
-        Ok(self.peers.iter().map(|addr| Node {
-            id: Uuid::nil(), // ID is often not known upfront in static config
-            address: addr.clone(),
-        }).collect())
+        Ok(self
+            .peers
+            .iter()
+            .map(|addr| Node {
+                id: Uuid::nil(), // ID is often not known upfront in static config
+                address: addr.clone(),
+            })
+            .collect())
     }
 
     async fn register(&self, _node: Node) -> Result<(), DistributedError> {
@@ -145,15 +149,17 @@ impl DnsNodeDiscovery {
 impl NodeDiscovery for DnsNodeDiscovery {
     async fn discover_nodes(&self) -> Result<Vec<Node>, DistributedError> {
         use tokio::net::lookup_host;
-        
+
         let query = format!("{}:{}", self.service_name, self.port);
         match lookup_host(query.clone()).await {
             Ok(addrs) => {
-                let nodes: Vec<Node> = addrs.map(|addr| Node {
-                    id: Uuid::nil(),
-                    address: addr.to_string(),
-                }).collect();
-                
+                let nodes: Vec<Node> = addrs
+                    .map(|addr| Node {
+                        id: Uuid::nil(),
+                        address: addr.to_string(),
+                    })
+                    .collect();
+
                 if nodes.is_empty() {
                     tracing::warn!("DNS discovery for {} returned no addresses", query);
                 } else {
@@ -205,7 +211,9 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
 }
 
 #[async_trait]
-impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E> for TcpPubSub<E> {
+impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> DistributedPubSub<E>
+    for TcpPubSub<E>
+{
     async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
         let nodes = {
             let cache = self.discovery_cache.lock();
@@ -225,24 +233,27 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             n
         };
 
-        let event_payload = bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))?;
+        let event_payload =
+            bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))?;
         let event_id = event.id;
         let my_node_id = self.node_id;
-        
+
         let mut full_payload = Vec::with_capacity(20 + event_payload.len());
         let total_len = (16 + event_payload.len()) as u32;
         full_payload.extend_from_slice(&total_len.to_be_bytes());
         full_payload.extend_from_slice(my_node_id.as_bytes());
         full_payload.extend_from_slice(&event_payload);
-        
+
         let payload_arc = Arc::new(full_payload);
         let conns_ref = self.connections.clone();
         let my_addr = self.listen_addr.clone();
 
         for node in nodes {
             // Self-filter check (ip-based as fallback for nil-id discovery)
-            if node.address == my_addr { continue; }
-            
+            if node.address == my_addr {
+                continue;
+            }
+
             let addr = node.address;
             let payload = payload_arc.clone();
             let conns = conns_ref.clone();
@@ -254,7 +265,12 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                 };
 
                 if stream.is_none() {
-                    match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    {
                         Ok(Ok(s)) => {
                             let _ = s.set_nodelay(true);
                             stream = Some(s);
@@ -284,7 +300,7 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         let addr = self.listen_addr.clone();
         let my_node_id = self.node_id;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-        
+
         tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => {
@@ -306,40 +322,69 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                             tracing::trace!("Mesh connection from {}", peer_addr);
                             let mut len_buf = [0u8; 4];
                             use tokio::io::AsyncReadExt;
-                            
+
                             loop {
-                                match tokio::time::timeout(std::time::Duration::from_secs(30), socket.read_exact(&mut len_buf)).await {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    socket.read_exact(&mut len_buf),
+                                )
+                                .await
+                                {
                                     Ok(Ok(_)) => {
                                         let body_len = u32::from_be_bytes(len_buf) as usize;
                                         if body_len > 10 * 1024 * 1024 {
-                                            tracing::error!("Oversized packet: {} from {}", body_len, peer_addr);
+                                            tracing::error!(
+                                                "Oversized packet: {} from {}",
+                                                body_len,
+                                                peer_addr
+                                            );
                                             break;
                                         }
 
                                         let mut body = vec![0u8; body_len];
                                         if let Err(e) = socket.read_exact(&mut body).await {
-                                            tracing::error!("Body read error from {}: {}", peer_addr, e);
+                                            tracing::error!(
+                                                "Body read error from {}: {}",
+                                                peer_addr,
+                                                e
+                                            );
                                             break;
                                         }
 
-                                        if body.len() < 16 { continue; }
+                                        if body.len() < 16 {
+                                            continue;
+                                        }
                                         let mut id_bytes = [0u8; 16];
                                         id_bytes.copy_from_slice(&body[..16]);
                                         let sender_id = Uuid::from_bytes(id_bytes);
 
-                                        if sender_id == my_node_id { continue; }
+                                        if sender_id == my_node_id {
+                                            continue;
+                                        }
 
                                         match bincode::deserialize::<Event<E>>(&body[16..]) {
                                             Ok(event) => {
-                                                tracing::info!("Mesh IN: Event {} (from Peer {})", event.id, sender_id);
+                                                tracing::info!(
+                                                    "Mesh IN: Event {} (from Peer {})",
+                                                    event.id,
+                                                    sender_id
+                                                );
                                                 let _ = tx.send(Ok(event)).await;
                                             }
-                                            Err(e) => tracing::error!("Bincode error from {}: {}", peer_addr, e),
+                                            Err(e) => tracing::error!(
+                                                "Bincode error from {}: {}",
+                                                peer_addr,
+                                                e
+                                            ),
                                         }
                                     }
                                     Ok(Err(e)) => {
                                         if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                                            tracing::debug!("Mesh connection closed by {}: {}", peer_addr, e);
+                                            tracing::debug!(
+                                                "Mesh connection closed by {}: {}",
+                                                peer_addr,
+                                                e
+                                            );
                                         }
                                         break;
                                     }
@@ -364,7 +409,10 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
 
 /// Pattern for handling Concurrency Conflicts gracefully.
 /// Takes a closure that reloads state and attempts the command again.
-pub async fn with_retries<T, E, F, Fut>(mut max_retries: usize, mut operation: F) -> Result<T, StoreError>
+pub async fn with_retries<T, E, F, Fut>(
+    mut max_retries: usize,
+    mut operation: F,
+) -> Result<T, StoreError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, StoreError>>,

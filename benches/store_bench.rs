@@ -2,8 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rust_eventbus::store::{EventStore, FileEventStore};
 use rust_eventbus::{Event, EventPayload};
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
 use std::time::SystemTime;
+use tokio::runtime::Runtime;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 enum BenchEvent {

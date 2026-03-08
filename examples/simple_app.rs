@@ -6,7 +6,7 @@ use tokio::time::{sleep, Duration};
 use rust_eventbus::{
     bus::EventBus,
     event::{Event, EventPayload},
-    projection::{Projection, EphemeralProjectionActor, ProjectionError},
+    projection::{EphemeralProjectionActor, Projection, ProjectionError},
     store::{EventStore, FileEventStore, FileSnapshotStore, SnapshotStore},
 };
 
@@ -109,9 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!("Appending events to store...");
-    let stored_events = event_store
-        .append(vec![e1, e2, e3])
-        .await?;
+    let stored_events = event_store.append(vec![e1, e2, e3]).await?;
 
     println!("Publishing events to bus...");
     // Publish so real-time listeners receive it
