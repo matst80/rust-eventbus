@@ -241,6 +241,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("PORT must be a number");
     
+    let mesh_port: u16 = std::env::var("MESH_PORT")
+        .unwrap_or_else(|_| "3001".to_string())
+        .parse()
+        .expect("MESH_PORT must be a number");
+    
     let host = std::env::var("HOST")
         .unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -255,8 +260,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Node Discovery: Environment (Static) or DNS (Kubernetes Headless)
     let peer_discovery: Arc<dyn rust_eventbus::distributed::NodeDiscovery> = 
         if let Ok(dns_query) = std::env::var("DNS_QUERY") {
-            println!("Discovery: DNS Query ({})", dns_query);
-            Arc::new(DnsNodeDiscovery::new(dns_query, port))
+            println!("Discovery: DNS Query ({}) using mesh port {}", dns_query, mesh_port);
+            Arc::new(DnsNodeDiscovery::new(dns_query, mesh_port))
         } else {
             println!("Discovery: Environment (PEERS)");
             Arc::new(EnvironmentNodeDiscovery::new())
@@ -271,10 +276,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_store_path).await?);
 
     let listen_addr = format!("{}:{}", host, port);
-    let mesh = Arc::new(TcpPubSub::new(node_id, listen_addr.clone(), peer_discovery));
+    let mesh_addr = format!("{}:{}", host, mesh_port);
+    let mesh = Arc::new(TcpPubSub::new(node_id, mesh_addr.clone(), peer_discovery));
 
     println!("Node ID:   {}", node_id);
-    println!("Listening: {}", listen_addr);
+    println!("API Listen: {}", listen_addr);
+    println!("Mesh Listen: {}", mesh_addr);
     println!("Storage:   {}", data_dir);
 
     let bus = EventBus::<TodoEvent>::new(1024);
