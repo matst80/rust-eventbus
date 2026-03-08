@@ -208,10 +208,17 @@ where
                 // Save snapshot after catch-up if there were unsaved events.
                 if events_since_snapshot > 0 {
                     let state_lock = self.state.lock().await;
-                    let _ = self
+                    if let Err(e) = self
                         .snapshot_store
                         .save(self.projection.name(), current_seq, &*state_lock)
-                        .await;
+                        .await
+                    {
+                        eprintln!(
+                            "Failed to save snapshot after catch-up for {}: {}",
+                            self.projection.name(),
+                            e
+                        );
+                    }
                 }
 
                 // 4. Process real-time events
@@ -398,19 +405,33 @@ where
                             }
                             if events_since_snapshot >= self.snapshot_interval {
                                 events_since_snapshot = 0;
-                                let _ = self
+                                if let Err(e) = self
                                     .snapshot_store
                                     .save(self.projection.name(), current_seq, &*state_lock)
-                                    .await;
+                                    .await
+                                {
+                                    eprintln!(
+                                        "Failed to save snapshot during catch-up for {}: {}",
+                                        self.projection.name(),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }
                     if events_since_snapshot > 0 {
                         let state_lock = self.state.lock().await;
-                        let _ = self
+                        if let Err(e) = self
                             .snapshot_store
                             .save(self.projection.name(), current_seq, &*state_lock)
-                            .await;
+                            .await
+                        {
+                            eprintln!(
+                                "Failed to save snapshot after catch-up for {}: {}",
+                                self.projection.name(),
+                                e
+                            );
+                        }
                     }
 
                     // Process live events
@@ -450,7 +471,9 @@ where
                                             }
                                             if events_since_snapshot >= self.snapshot_interval {
                                                 events_since_snapshot = 0;
-                                                let _ = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await;
+                                                if let Err(e) = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await {
+                                                    eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
+                                                }
                                             }
                                         }
                                     }
