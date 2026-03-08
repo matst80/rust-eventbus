@@ -6,7 +6,7 @@ use tokio::time::{sleep, Duration};
 use rust_eventbus::{
     bus::EventBus,
     event::{Event, EventPayload},
-    projection::{Projection, ProjectionActor, ProjectionError},
+    projection::{Projection, EphemeralProjectionActor, ProjectionError},
     store::{EventStore, FileEventStore, FileSnapshotStore, SnapshotStore},
 };
 
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup Projection Manager Loop
     // The projection will run in its own fully independent Tokio task, preventing global locking!
     let projection = Arc::new(UserCountProjection);
-    let projection_actor = ProjectionActor::new(
+    let projection_actor = EphemeralProjectionActor::new(
         bus.clone(),
         event_store.clone(),
         projection,

@@ -16,7 +16,7 @@ use rust_eventbus::{
     distributed::{DistributedError, DistributedPubSub, LockError, ProjectionLockManager},
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
-    store::{EventStore, FileEventStore, FileSnapshotStore},
+    store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
 };
 
 // 1. Define Domain Events
@@ -230,6 +230,7 @@ async fn create_todo(
     State(state): State<AppState>,
     Json(req): Json<CreateTodoRequest>,
 ) -> Result<Json<TodoItem>, StatusCode> {
+    println!("Node {} handling create_todo for: {}", state.node_id, req.title);
     let aggregate_id = Uuid::new_v4().to_string();
     let event = Event::new(&aggregate_id, 1, TodoEvent::TodoCreated { title: req.title.clone() });
     
@@ -276,6 +277,18 @@ async fn delete_todo(
     let event = Event::new(&id, 3, TodoEvent::TodoDeleted);
     
     let stored = state.event_store.append(vec![event]).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    
+    // Trigger log compaction asynchronously so we prune the deleted todo's history.
+    let es = state.event_store.clone();
+    tokio::spawn(async move {
+        let rule = CompactionRule::PruneIf(|payload| matches!(payload, TodoEvent::TodoDeleted));
+        match EventStore::<TodoEvent>::compact(es.as_ref(), rule).await {
+            Ok(removed) if removed > 0 => println!("🧹 [LOG COMPACTION] Removed {} stale events from log", removed),
+            Err(e) => eprintln!("❌ Log compaction failed: {}", e),
+            _ => (),
+        }
+    });
+
     for e in stored {
         let _ = state.bus.publish(e.clone());
         let _ = state.mesh.publish(&e).await;

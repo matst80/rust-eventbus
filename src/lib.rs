@@ -10,3 +10,4 @@ pub mod distributed;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
+pub use projection::ProjectionHandle;

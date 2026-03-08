@@ -98,7 +98,7 @@ where
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(StoreError::Conflict(msg)) if max_retries > 0 => {
+            Err(StoreError::Conflict(_msg)) if max_retries > 0 => {
                 // Normally you'd want to log a warning here.
                 max_retries -= 1;
                 // Backoff could be implemented here

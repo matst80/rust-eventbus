@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +23,20 @@ pub enum StoreError {
     Other(String),
 }
 
+/// Defines the strategy for log compaction.
+pub enum CompactionRule<E> {
+    /// Keep only the latest event for each aggregate ID (basic log compaction).
+    LatestPerAggregate,
+    /// Keep the latest event, but prune the entire aggregate if the latest event satisfies the condition.
+    PruneIf(fn(&E) -> bool),
+}
+
+impl<E> Default for CompactionRule<E> {
+    fn default() -> Self {
+        Self::LatestPerAggregate
+    }
+}
+
 /// Core trait representing an asynchronous Event Store.
 /// Handles appending strongly typed events and streaming them back efficiently.
 #[async_trait]
@@ -32,6 +47,14 @@ pub trait EventStore<E: EventPayload>: Send + Sync + 'static {
     /// Streams all events starting from a specific global sequence ID (for catching up projections).
     /// Returns a BoxStream to avoid loading all events into memory.
     fn read_all_from(&self, start_sequence: u64) -> BoxStream<'_, Result<Event<E>, StoreError>>;
+
+    /// Compact the event log using the specified rule (default: keep latest per aggregate).
+    /// Returns the number of events removed.
+    async fn compact(&self, rule: CompactionRule<E>) -> Result<u64, StoreError>;
+
+    /// Remove all events with global_sequence_num <= min_seq.
+    /// Returns the number of events removed.
+    async fn truncate_before(&self, min_seq: u64) -> Result<u64, StoreError>;
 }
 
 /// Core trait for saving and loading Projection Snapshots with full Type Safety.
@@ -50,6 +73,9 @@ where
         sequence_num: u64,
         state: &S,
     ) -> Result<(), StoreError>;
+
+    /// Delete the snapshot for a projection (used during reset).
+    async fn delete(&self, projection_name: &str) -> Result<(), StoreError>;
 }
 
 use tokio::sync::{mpsc, Mutex};
@@ -100,6 +126,49 @@ impl FileEventStore {
             })),
         })
     }
+
+    /// Read all events from the file into a Vec (helper for compaction/truncation).
+    async fn read_all_events<E: EventPayload>(&self) -> Result<Vec<Event<E>>, StoreError> {
+        let path = &self.file_path;
+        match File::open(path).await {
+            Ok(f) => {
+                let mut reader = BufReader::new(f);
+                let mut events = Vec::new();
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    match reader.read_exact(&mut len_buf).await {
+                        Ok(_) => {
+                            let len = u32::from_le_bytes(len_buf) as usize;
+                            let mut data = vec![0u8; len];
+                            reader.read_exact(&mut data).await?;
+                            let event: Event<E> = bincode::deserialize(&data)?;
+                            events.push(event);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => return Err(StoreError::Io(e)),
+                    }
+                }
+                Ok(events)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
+    /// Write events to a temp file then atomically rename over the main file.
+    async fn atomic_rewrite<E: EventPayload>(&self, events: &[Event<E>]) -> Result<(), StoreError> {
+        let tmp_path = self.file_path.with_extension("tmp");
+        let mut file = File::create(&tmp_path).await?;
+        for event in events {
+            let bytes = bincode::serialize(event)?;
+            let len = bytes.len() as u32;
+            file.write_all(&len.to_le_bytes()).await?;
+            file.write_all(&bytes).await?;
+        }
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp_path, &self.file_path).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -126,6 +195,13 @@ where
             .send(buffer)
             .await
             .map_err(|_| StoreError::Other("Background writer closed".into()))?;
+
+        // Flush to ensure data is available for reads immediately after append.
+        inner
+            .tx
+            .send(vec![])
+            .await
+            .ok(); // no-op flush sentinel; harmless if writer is gone
 
         Ok(events)
     }
@@ -183,6 +259,59 @@ where
 
         stream.boxed()
     }
+
+    async fn compact(&self, rule: CompactionRule<E>) -> Result<u64, StoreError> {
+        let inner = self.inner.lock().await;
+        let all_events: Vec<Event<E>> = self.read_all_events().await?;
+        let original_count = all_events.len() as u64;
+
+        // Keep only the latest event per aggregate_id (highest global_sequence_num).
+        let mut latest: HashMap<String, Event<E>> = HashMap::new();
+        for event in all_events {
+            let entry = latest
+                .entry(event.aggregate_id.clone())
+                .or_insert_with(|| event.clone());
+            if event.global_sequence_num > entry.global_sequence_num {
+                *entry = event;
+            }
+        }
+
+        // Apply compaction rules:
+        // By default, we keep the latest. If PruneIf is provided, we remove aggregates
+        // where the latest event matches the predicate (e.g., is a 'Deleted' event).
+        if let CompactionRule::PruneIf(predicate) = rule {
+            latest.retain(|_, ev| !(predicate)(&ev.payload));
+        }
+
+        let mut kept: Vec<Event<E>> = latest.into_values().collect();
+        kept.sort_by_key(|e| e.global_sequence_num);
+
+        self.atomic_rewrite(&kept).await?;
+
+        // Update next_global_seq to be after the highest remaining event.
+        // We hold the lock so this is safe; drop it explicitly via the guard held above.
+        drop(inner);
+        let mut inner = self.inner.lock().await;
+        if let Some(last) = kept.last() {
+            inner.next_global_seq = last.global_sequence_num + 1;
+        }
+
+        Ok(original_count - kept.len() as u64)
+    }
+
+    async fn truncate_before(&self, min_seq: u64) -> Result<u64, StoreError> {
+        let _inner = self.inner.lock().await;
+        let all_events: Vec<Event<E>> = self.read_all_events().await?;
+        let original_count = all_events.len() as u64;
+
+        let kept: Vec<Event<E>> = all_events
+            .into_iter()
+            .filter(|e| e.global_sequence_num > min_seq)
+            .collect();
+
+        self.atomic_rewrite(&kept).await?;
+        Ok(original_count - kept.len() as u64)
+    }
 }
 
 /// A simple file-based Snapshot Store. Saves state as `<projection_name>.snapshot.bin`.
@@ -193,7 +322,7 @@ pub struct FileSnapshotStore {
 
 impl FileSnapshotStore {
     pub async fn new(dir: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = dir.as_ref().to_path_buf();
+        let path = std::env::current_dir()?.join(dir.as_ref());
         tokio::fs::create_dir_all(&path).await?;
         Ok(Self { dir: path })
     }
@@ -233,7 +362,8 @@ where
         state: &S,
     ) -> Result<(), StoreError> {
         let path = self.file_path(projection_name);
-        let tmp_path = self.dir.join(format!("{}.snapshot.tmp", projection_name));
+        let tmp_id = uuid::Uuid::new_v4();
+        let tmp_path = self.dir.join(format!("{}.{}.snapshot.tmp", projection_name, tmp_id));
         
         let env = SnapshotEnvelope {
             sequence_num,
@@ -249,6 +379,15 @@ where
         
         tokio::fs::rename(tmp_path, path).await?;
         Ok(())
+    }
+
+    async fn delete(&self, projection_name: &str) -> Result<(), StoreError> {
+        let path = self.file_path(projection_name);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 }
 
@@ -293,6 +432,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_compact_keeps_latest() {
+        let dir = std::env::temp_dir().join(format!("compact_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let store = FileEventStore::new(&dir).await.unwrap();
+
+        // 3 events for aggregate "a", 1 for "b"
+        let events = vec![
+            Event::new("a", 1, DummyEvent { value: "a1".into() }),
+            Event::new("a", 2, DummyEvent { value: "a2".into() }),
+            Event::new("b", 1, DummyEvent { value: "b1".into() }),
+            Event::new("a", 3, DummyEvent { value: "a3".into() }),
+        ];
+        store.append(events).await.unwrap();
+
+        let removed = EventStore::<DummyEvent>::compact(&store, CompactionRule::LatestPerAggregate).await.unwrap();
+        assert_eq!(removed, 2); // a1 and a2 removed
+
+        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> = store.read_all_from(0);
+        let mut remaining = Vec::new();
+        while let Some(Ok(ev)) = stream.next().await {
+            remaining.push(ev);
+        }
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].payload.value, "b1");
+        assert_eq!(remaining[1].payload.value, "a3");
+
+        let _ = tokio::fs::remove_file(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_truncate_before() {
+        let dir = std::env::temp_dir().join(format!("truncate_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let store = FileEventStore::new(&dir).await.unwrap();
+
+        let events = vec![
+            Event::new("a", 1, DummyEvent { value: "e1".into() }),
+            Event::new("a", 2, DummyEvent { value: "e2".into() }),
+            Event::new("b", 1, DummyEvent { value: "e3".into() }),
+        ];
+        store.append(events).await.unwrap();
+
+        // Truncate events with seq <= 2 (removes e1 seq=1, e2 seq=2)
+        let removed = EventStore::<DummyEvent>::truncate_before(&store, 2).await.unwrap();
+        assert_eq!(removed, 2);
+
+        let mut stream: BoxStream<'_, Result<Event<DummyEvent>, StoreError>> = store.read_all_from(0);
+        let mut remaining = Vec::new();
+        while let Some(Ok(ev)) = stream.next().await {
+            remaining.push(ev);
+        }
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].payload.value, "e3");
+
+        let _ = tokio::fs::remove_file(&dir).await;
+    }
+
+    #[tokio::test]
     async fn test_bincode_snapshot_store() {
         let dir = std::env::temp_dir().join(format!("snapshot_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
         let store = FileSnapshotStore::new(&dir).await.unwrap();
@@ -311,6 +506,26 @@ mod tests {
         let (seq, loaded_state): (u64, DummyState) = loaded.unwrap();
         assert_eq!(seq, 5);
         assert_eq!(loaded_state.counter, 42);
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_delete() {
+        let dir = std::env::temp_dir().join(format!("snap_del_test_{}", SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_micros()));
+        let store = FileSnapshotStore::new(&dir).await.unwrap();
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct S { v: u32 }
+
+        SnapshotStore::<S>::save(&store, "proj", 10, &S { v: 1 }).await.unwrap();
+        assert!(SnapshotStore::<S>::load(&store, "proj").await.unwrap().is_some());
+
+        SnapshotStore::<S>::delete(&store, "proj").await.unwrap();
+        assert!(SnapshotStore::<S>::load(&store, "proj").await.unwrap().is_none());
+
+        // Deleting again is idempotent
+        SnapshotStore::<S>::delete(&store, "proj").await.unwrap();
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
