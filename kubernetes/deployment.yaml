@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-app
+  labels:
+    app: todo-app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: todo-app
+  template:
+    metadata:
+      labels:
+        app: todo-app
+    spec:
+      containers:
+      - name: todo-app
+        image: matst80/rust-eventbus-todo:latest # Replace with your actual image
+        ports:
+        - containerPort: 3000
+        env:
+        - name: PORT
+          value: "3000"
+        - name: DATA_DIR
+          value: "/app/data"
+        - name: DNS_QUERY
+          value: "todo-app-headless.default.svc.cluster.local"
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: data-storage
+          mountPath: /app/data
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      volumes:
+      - name: data-storage
+        persistentVolumeClaim:
+          claimName: todo-app-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: todo-app-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-app-headless
+spec:
+  clusterIP: None # Headless Service for DNS discovery
+  selector:
+    app: todo-app
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-app-service
+spec:
+  selector:
+    app: todo-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: todo-app-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - todo.k6n.net
+    secretName: todo-app-tls
+  rules:
+  - host: todo.k6n.net
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: todo-app-service
+            port:
+              number: 80

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use rust_eventbus::{
     bus::EventBus,
-    distributed::{DistributedError, DistributedPubSub, LockError, ProjectionLockManager},
+    distributed::{DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, LockError, ProjectionLockManager, TcpPubSub},
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
     store::{CompactionRule, EventStore, FileEventStore, FileSnapshotStore},
@@ -94,12 +94,11 @@ impl Projection<TodoEvent, TodoState> for TodoProjection {
 }
 
 /// Durable Projection: Runs on exactly ONE node across the cluster.
-/// e.g. Sending emails, integrating with external systems.
 pub struct EmailNotificationProjection;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EmailState {
-    pub count: u32, // Just tracking something simple for snapshotting
+    pub count: u32,
 }
 
 #[async_trait]
@@ -121,93 +120,31 @@ impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
     }
 }
 
-// 4. Mock Distributed Implementations
+// 4. Distributed Implementations
 
-#[derive(Clone)]
-pub struct MockCluster {
-    pub network: tokio::sync::broadcast::Sender<(Uuid, Event<TodoEvent>)>,
-    pub lock_state: Arc<tokio::sync::Mutex<Option<Uuid>>>,
-}
-
-pub struct NodeMesh {
-    node_id: Uuid,
-    cluster: MockCluster,
-}
-
-#[async_trait]
-impl DistributedPubSub<TodoEvent> for NodeMesh {
-    async fn publish(&self, event: &Event<TodoEvent>) -> Result<(), DistributedError> {
-        let _ = self.cluster.network.send((self.node_id, event.clone()));
-        Ok(())
-    }
-
-    async fn subscribe(&self) -> futures::stream::BoxStream<'static, Result<Event<TodoEvent>, DistributedError>> {
-        let rx = self.cluster.network.subscribe();
-        let my_id = self.node_id;
-        
-        let stream = futures::stream::unfold(rx, move |mut rx| async move {
-            loop {
-                match rx.recv().await {
-                    Ok((sender_id, event)) => {
-                        if sender_id != my_id {
-                            return Some((Ok(event), rx));
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return None;
-                    }
-                }
-            }
-        });
-            
-        Box::pin(stream)
-    }
-}
-
-pub struct MockLockManager {
-    cluster: MockCluster,
-}
+pub struct MockLockManager;
 
 #[async_trait]
 impl ProjectionLockManager for MockLockManager {
-    async fn acquire_lock(&self, _projection_name: &str, node_id: &Uuid) -> Result<bool, LockError> {
-        let mut l = self.cluster.lock_state.lock().await;
-        if l.is_none() || *l == Some(*node_id) {
-            *l = Some(*node_id);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    async fn acquire_lock(&self, _projection_name: &str, _node_id: &Uuid) -> Result<bool, LockError> {
+        Ok(true)
     }
 
-    async fn keep_alive(&self, _projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
-        let l = self.cluster.lock_state.lock().await;
-        if *l == Some(*node_id) {
-            Ok(())
-        } else {
-            Err(LockError::AlreadyHeld)
-        }
+    async fn keep_alive(&self, _projection_name: &str, _node_id: &Uuid) -> Result<(), LockError> {
+        Ok(())
     }
 
-    async fn release_lock(&self, _projection_name: &str, node_id: &Uuid) -> Result<(), LockError> {
-        let mut l = self.cluster.lock_state.lock().await;
-        if *l == Some(*node_id) {
-            *l = None;
-        }
+    async fn release_lock(&self, _projection_name: &str, _node_id: &Uuid) -> Result<(), LockError> {
         Ok(())
     }
 }
-
 
 // 5. Shared Web State
 #[derive(Clone)]
 struct AppState {
     node_id: Uuid,
     bus: EventBus<TodoEvent>,
-    mesh: Arc<NodeMesh>,
+    mesh: Arc<TcpPubSub<TodoEvent>>,
     event_store: Arc<FileEventStore>,
     projection_state: Arc<tokio::sync::Mutex<TodoState>>,
 }
@@ -234,13 +171,11 @@ async fn create_todo(
     let aggregate_id = Uuid::new_v4().to_string();
     let event = Event::new(&aggregate_id, 1, TodoEvent::TodoCreated { title: req.title.clone() });
     
-    // Persist to Shared EventStore
     let stored = state.event_store.append(vec![event]).await.map_err(|e| {
         eprintln!("Store error: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     
-    // Publish locally and to cluster
     for e in stored {
         let _ = state.bus.publish(e.clone());
         let _ = state.mesh.publish(&e).await;
@@ -278,7 +213,6 @@ async fn delete_todo(
     
     let stored = state.event_store.append(vec![event]).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     
-    // Trigger log compaction asynchronously so we prune the deleted todo's history.
     let es = state.event_store.clone();
     tokio::spawn(async move {
         let rule = CompactionRule::PruneIf(|payload| matches!(payload, TodoEvent::TodoDeleted));
@@ -300,70 +234,63 @@ async fn delete_todo(
 // 7. Wiring
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting Distributed Todo App Cluster...");
+    println!("🚀 Starting Distributed Todo App Node (TCP Mesh)...");
 
-    let (mesh_tx, _) = tokio::sync::broadcast::channel(1024);
-    let mock_cluster = MockCluster {
-        network: mesh_tx,
-        lock_state: Arc::new(tokio::sync::Mutex::new(None)),
-    };
-
-    // Shared storage!
-    let event_store = Arc::new(FileEventStore::new("todo_events_cluster.bin").await?);
-    let snapshot_store = Arc::new(FileSnapshotStore::new("todo_snapshots_cluster").await?);
-
-    // Spawn Node 1
-    spawn_node(
-        3000, 
-        mock_cluster.clone(), 
-        event_store.clone(), 
-        snapshot_store.clone()
-    ).await;
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .expect("PORT must be a number");
     
-    // Spawn Node 2
-    spawn_node(
-        3001, 
-        mock_cluster.clone(), 
-        event_store.clone(), 
-        snapshot_store.clone()
-    ).await;
+    let host = std::env::var("HOST")
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
 
-    // Keep main thread alive
-    tokio::signal::ctrl_c().await?;
-    println!("Shutting down...");
-    Ok(())
-}
+    let data_dir = std::env::var("DATA_DIR")
+        .unwrap_or_else(|_| "./data".to_string());
+    
+    let node_id_str = std::env::var("NODE_ID").ok();
+    let node_id = node_id_str
+        .and_then(|s| Uuid::parse_str(&s).ok())
+        .unwrap_or_else(Uuid::new_v4);
 
-async fn spawn_node(
-    port: u16,
-    mock_cluster: MockCluster,
-    event_store: Arc<FileEventStore>,
-    snapshot_store: Arc<FileSnapshotStore>,
-) {
-    let node_id = Uuid::new_v4();
-    println!("🚀 Starting Node {} on port {}", node_id, port);
+    // Node Discovery: Environment (Static) or DNS (Kubernetes Headless)
+    let peer_discovery: Arc<dyn rust_eventbus::distributed::NodeDiscovery> = 
+        if let Ok(dns_query) = std::env::var("DNS_QUERY") {
+            println!("Discovery: DNS Query ({})", dns_query);
+            Arc::new(DnsNodeDiscovery::new(dns_query, port))
+        } else {
+            println!("Discovery: Environment (PEERS)");
+            Arc::new(EnvironmentNodeDiscovery::new())
+        };
+
+    tokio::fs::create_dir_all(&data_dir).await?;
+
+    let event_store_path = format!("{}/todo_events.bin", data_dir);
+    let snapshot_store_path = format!("{}/todo_snapshots", data_dir);
+
+    let event_store = Arc::new(FileEventStore::new(&event_store_path).await?);
+    let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_store_path).await?);
+
+    let listen_addr = format!("{}:{}", host, port);
+    let mesh = Arc::new(TcpPubSub::new(node_id, listen_addr.clone(), peer_discovery));
+
+    println!("Node ID:   {}", node_id);
+    println!("Listening: {}", listen_addr);
+    println!("Storage:   {}", data_dir);
 
     let bus = EventBus::<TodoEvent>::new(1024);
-    
-    let mesh = Arc::new(NodeMesh {
-        node_id,
-        cluster: mock_cluster.clone(),
-    });
+    let mock_lock_manager = Arc::new(MockLockManager);
 
-    let mock_lock_manager = Arc::new(MockLockManager { cluster: mock_cluster });
-
-    // 1. Setup Background task to forward distributed events -> local bus
     let mesh_clone = mesh.clone();
     let bus_clone = bus.clone();
     tokio::spawn(async move {
         let mut stream = mesh_clone.subscribe().await;
-        while let Some(Ok(event)) = stream.next().await {
-            // Arrived from network -> broadcast locally
-            let _ = bus_clone.publish(event);
+        while let Some(item) = stream.next().await {
+            if let Ok(event) = item {
+                let _ = bus_clone.publish(event);
+            }
         }
     });
 
-    // 2. Setup Ephemeral Projection (Runs on all nodes)
     let ephemeral_actor = EphemeralProjectionActor::new(
         bus.clone(),
         event_store.clone(),
@@ -373,7 +300,6 @@ async fn spawn_node(
     let projection_state = ephemeral_actor.get_state();
     tokio::spawn(ephemeral_actor.spawn());
 
-    // 3. Setup Durable Projection (Runs on only ONE node)
     let durable_actor = DurableProjectionActor::new(
         bus.clone(),
         event_store.clone(),
@@ -384,7 +310,6 @@ async fn spawn_node(
     );
     tokio::spawn(durable_actor.spawn());
 
-    // 4. API Server Setup
     let app_state = AppState {
         node_id,
         bus,
@@ -399,9 +324,15 @@ async fn spawn_node(
         .route("/todos/{id}", delete(delete_todo))
         .with_state(app_state);
 
-    tokio::spawn(async move {
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = TcpListener::bind(addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
-    });
+    let addr: SocketAddr = listen_addr.parse()?;
+    let listener = TcpListener::bind(addr).await?;
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            println!("\nShutting down gracefully...");
+        })
+        .await?;
+
+    Ok(())
 }
