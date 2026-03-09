@@ -75,6 +75,7 @@ pub struct EphemeralProjectionActor<E: EventPayload, S, P, SS, ES> {
     cmd_rx: watch::Receiver<ProjectionCommand>,
     _marker: std::marker::PhantomData<E>,
     version: Option<Arc<AtomicU64>>,
+    task_limiter: Option<crate::task_limiter::TaskLimiter>,
 }
 
 impl<E, S, P, SS, ES> EphemeralProjectionActor<E, S, P, SS, ES>
@@ -103,6 +104,7 @@ where
             cmd_rx,
             _marker: std::marker::PhantomData,
             version: None,
+            task_limiter: None,
         }
     }
 
@@ -115,6 +117,12 @@ where
     /// Set a version counter to track projection changes (for ETag support).
     pub fn with_version(mut self, version: Arc<AtomicU64>) -> Self {
         self.version = Some(version);
+        self
+    }
+
+    /// Set a task limiter to control concurrency.
+    pub fn with_task_limiter(mut self, task_limiter: crate::task_limiter::TaskLimiter) -> Self {
+        self.task_limiter = Some(task_limiter);
         self
     }
 
@@ -132,7 +140,7 @@ where
 
     /// Spawns the projection actor loop into the tokio runtime.
     pub async fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let task = async move {
             let mut cmd_rx = self.cmd_rx.clone();
 
             loop {
@@ -276,7 +284,13 @@ where
                     }
                 }
             }
-        })
+        };
+
+        if let Some(limiter) = self.task_limiter.clone() {
+            limiter.spawn(task).await
+        } else {
+            tokio::spawn(task)
+        }
     }
 }
 
@@ -295,6 +309,7 @@ pub struct DurableProjectionActor<E: EventPayload, S, P, SS, ES, LM: ?Sized> {
     cmd_rx: watch::Receiver<ProjectionCommand>,
     _marker: std::marker::PhantomData<E>,
     version: Option<Arc<AtomicU64>>,
+    task_limiter: Option<crate::task_limiter::TaskLimiter>,
 }
 
 impl<E, S, P, SS, ES, LM> DurableProjectionActor<E, S, P, SS, ES, LM>
@@ -328,6 +343,7 @@ where
             cmd_rx,
             _marker: std::marker::PhantomData,
             version: None,
+            task_limiter: None,
         }
     }
 
@@ -338,6 +354,11 @@ where
 
     pub fn with_version(mut self, version: Arc<AtomicU64>) -> Self {
         self.version = Some(version);
+        self
+    }
+
+    pub fn with_task_limiter(mut self, task_limiter: crate::task_limiter::TaskLimiter) -> Self {
+        self.task_limiter = Some(task_limiter);
         self
     }
 
@@ -352,7 +373,7 @@ where
     }
 
     pub async fn spawn(self) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+        let task = async move {
             let mut cmd_rx = self.cmd_rx.clone();
 
             loop {
@@ -520,6 +541,12 @@ where
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
-        })
+        };
+
+        if let Some(limiter) = self.task_limiter.clone() {
+            limiter.spawn(task).await
+        } else {
+            tokio::spawn(task)
+        }
     }
 }

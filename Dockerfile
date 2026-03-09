@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y \
 # Copy the entire workspace
 COPY . .
 
-# Build the example
-RUN cargo build --release --example todo_app
+# Build the example with optimizations
+# RUSTFLAGS allows us to pass architecture-specific hints if we know the target
+# For a generic arm64 build, we mostly rely on the release profile.
+RUN cargo build --release --example todo_app --features mimalloc
 
 # Runtime Stage - Distroless for security and size
 FROM gcr.io/distroless/cc-debian12

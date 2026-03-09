@@ -63,6 +63,7 @@ This document explains the in-repo Event Bus and the zero-dependency TCP-based P
 - `NODE_ID` — optional, supply a UUID to identify node (auto-generated otherwise)
 - `PEERS` — comma-separated peer addresses for `EnvironmentNodeDiscovery` (e.g., `127.0.0.1:3001,127.0.0.1:3002`)
 - `DNS_QUERY` — when set, `DnsNodeDiscovery` will lookup targets for clustering
+- `WORKER_THREADS` — number of Tokio worker threads (default 2); lower values often improve performance on Raspberry Pi/K8s with fixed CPU limits.
 
 **Operational notes & trade-offs**
 - The mesh is *best-effort*: publishes spawn background tasks and will not block the HTTP path for every peer. It logs success/failure and attempts reconnection when needed.

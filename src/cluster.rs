@@ -184,6 +184,7 @@ pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde
     pub data_dir: String,
     pub projection_version: Arc<AtomicU64>,
     pub discovery: Arc<dyn NodeDiscovery>,
+    pub task_limiter: crate::task_limiter::TaskLimiter,
 }
 /// Initialize cluster-related components from environment variables (DATA_DIR, PORT, MESH_* etc.).
 pub use crate::cluster_config::ClusterConfig;
@@ -200,6 +201,8 @@ pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::D
     let data_dir = config.data_dir.clone();
 
     let node_id = config.node_id.unwrap_or_else(Uuid::new_v4);
+
+    let task_limiter = crate::task_limiter::TaskLimiter::new(config.max_concurrent_tasks);
 
     // Node Discovery
     let peer_discovery: Arc<dyn NodeDiscovery> = if let Some(dns_query) = config.dns_query {
@@ -225,6 +228,7 @@ pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::D
         mesh_bind_addr.clone(),
         mesh_advertised_addr.clone(),
         peer_discovery.clone(),
+        Some(task_limiter.clone()),
     )
     .await;
 
@@ -247,5 +251,6 @@ pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::D
         data_dir,
         projection_version,
         discovery: peer_discovery,
+        task_limiter,
     })
 }

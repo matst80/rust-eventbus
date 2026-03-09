@@ -1,3 +1,7 @@
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -156,6 +160,7 @@ struct AppState {
     event_store: Arc<FileEventStore>,
     projection_state: Arc<parking_lot::RwLock<TodoState>>,
     projection_version: Arc<AtomicU64>,
+    task_limiter: rust_eventbus::task_limiter::TaskLimiter,
 }
 
 // 6. Define API Handlers
@@ -264,7 +269,10 @@ async fn delete_todo(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let es = state.event_store.clone();
+    let limiter = state.task_limiter.clone();
     tokio::spawn(async move {
+        // Use limiter if we want to count this toward the 50 tasks
+        let _permit = limiter.acquire_permit().await;
         let rule = CompactionRule::PruneIf(|payload| matches!(payload, TodoEvent::TodoDeleted));
         match EventStore::<TodoEvent>::compact(es.as_ref(), rule).await {
             Ok(removed) if removed > 0 => println!(
@@ -285,155 +293,171 @@ async fn delete_todo(
 }
 
 // 7. Wiring
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    tracing::info!("Starting Distributed Todo App Node (TCP Mesh)...");
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = rust_eventbus::cluster::ClusterConfig::from_env();
-    let port = config.port;
-    let host = config.host.clone();
-    let _mesh_bind_host = config.mesh_bind_host.clone();
+    let worker_threads = config.worker_threads;
 
-    let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>(config).await?;
-    let node_id = cluster.node_id;
-    let event_store = cluster.event_store.clone();
-    let snapshot_store = cluster.snapshot_store.clone();
-    let mesh = cluster.mesh.clone();
-    let lock_manager = cluster.lock_manager.clone();
-    let mesh_bind_addr = cluster.mesh_bind_addr.clone();
-    let mesh_advertised_addr = cluster.mesh_advertised_addr.clone();
-    let discovery_for_probe = cluster.discovery.clone();
-    let data_dir = cluster.data_dir.clone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
 
-    let listen_addr = format!("{}:{}", host, port);
+    runtime.block_on(async move {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
 
-    tracing::info!("***************************************************");
-    tracing::info!("Starting Node ID: {}", node_id);
-    tracing::info!("API Listen:      {}", listen_addr);
-    tracing::info!("Mesh Listen:     {}", mesh_bind_addr);
-    tracing::info!("Mesh Advertise:  {}", mesh_advertised_addr);
-    tracing::info!("Storage:         {}", data_dir);
-    tracing::info!("***************************************************");
+        tracing::info!(
+            "Starting Distributed Todo App Node ({} worker threads)...",
+            worker_threads
+        );
 
-    let bus = EventBus::<TodoEvent>::new(1024);
-    let projection_version = cluster.projection_version.clone();
+        let port = config.port;
+        let host = config.host.clone();
+        let _mesh_bind_host = config.mesh_bind_host.clone();
 
-    let ephemeral_actor = EphemeralProjectionActor::new(
-        bus.clone(),
-        event_store.clone(),
-        Arc::new(TodoProjection),
-        snapshot_store.clone(),
-    )
-    .with_version(projection_version.clone());
-    let projection_state = ephemeral_actor.get_state();
-    tokio::spawn(ephemeral_actor.spawn());
+        let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>(config).await?;
+        let node_id = cluster.node_id;
+        let event_store = cluster.event_store.clone();
+        let snapshot_store = cluster.snapshot_store.clone();
+        let mesh = cluster.mesh.clone();
+        let lock_manager = cluster.lock_manager.clone();
+        let mesh_bind_addr = cluster.mesh_bind_addr.clone();
+        let mesh_advertised_addr = cluster.mesh_advertised_addr.clone();
+        let discovery_for_probe = cluster.discovery.clone();
+        let data_dir = cluster.data_dir.clone();
 
-    let durable_actor = DurableProjectionActor::new(
-        bus.clone(),
-        event_store.clone(),
-        Arc::new(EmailNotificationProjection),
-        snapshot_store.clone(),
-        lock_manager,
-        node_id,
-    );
-    tokio::spawn(durable_actor.spawn());
+        let listen_addr = format!("{}:{}", host, port);
 
-    let self_mesh_addr = mesh_advertised_addr.clone();
-    tokio::spawn(async move {
-        loop {
-            match discovery_for_probe.discover_nodes().await {
-                Ok(nodes) => {
-                    let peer_count = nodes
-                        .iter()
-                        .filter(|n| !same_endpoint(&n.address, &self_mesh_addr))
-                        .count();
-                    tracing::info!("Discovery probe: {} peer(s) visible", peer_count);
+        tracing::info!("***************************************************");
+        tracing::info!("Starting Node ID: {}", node_id);
+        tracing::info!("API Listen:      {}", listen_addr);
+        tracing::info!("Mesh Listen:     {}", mesh_bind_addr);
+        tracing::info!("Mesh Advertise:  {}", mesh_advertised_addr);
+        tracing::info!("Storage:         {}", data_dir);
+        tracing::info!("***************************************************");
+
+        let bus = EventBus::<TodoEvent>::new(1024);
+        let projection_version = cluster.projection_version.clone();
+
+        let ephemeral_actor = EphemeralProjectionActor::new(
+            bus.clone(),
+            event_store.clone(),
+            Arc::new(TodoProjection),
+            snapshot_store.clone(),
+        )
+        .with_version(projection_version.clone())
+        .with_task_limiter(cluster.task_limiter.clone());
+        let projection_state = ephemeral_actor.get_state();
+        ephemeral_actor.spawn().await;
+
+        let durable_actor = DurableProjectionActor::new(
+            bus.clone(),
+            event_store.clone(),
+            Arc::new(EmailNotificationProjection),
+            snapshot_store.clone(),
+            lock_manager,
+            node_id,
+        )
+        .with_task_limiter(cluster.task_limiter.clone());
+        durable_actor.spawn().await;
+
+        let self_mesh_addr = mesh_advertised_addr.clone();
+        let limiter_discovery = cluster.task_limiter.clone();
+        limiter_discovery.spawn(async move {
+            loop {
+                match discovery_for_probe.discover_nodes().await {
+                    Ok(nodes) => {
+                        let peer_count = nodes
+                            .iter()
+                            .filter(|n| !same_endpoint(&n.address, &self_mesh_addr))
+                            .count();
+                        tracing::info!("Discovery probe: {} peer(s) visible", peer_count);
+                    }
+                    Err(e) => tracing::warn!("Discovery probe failed: {}", e),
                 }
-                Err(e) => tracing::warn!("Discovery probe failed: {}", e),
+
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
+        }).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
+        let app_state = AppState {
+            node_id,
+            bus,
+            mesh,
+            event_store,
+            projection_state,
+            projection_version,
+            task_limiter: cluster.task_limiter.clone(),
+        };
 
-    let app_state = AppState {
-        node_id,
-        bus,
-        mesh,
-        event_store,
-        projection_state,
-        projection_version,
-    };
-
-    let mesh_for_subscribe = app_state.mesh.clone();
-    let bus_for_mesh = app_state.bus.clone();
-    let event_store_for_mesh = app_state.event_store.clone();
-    tokio::spawn(async move {
-        let mut incoming = mesh_for_subscribe.subscribe().await;
-        while let Some(result) = incoming.next().await {
-            match result {
-                Ok(event) => {
-                    // Persist the remote event into the local EventStore so the local
-                    // projections can rely on a monotonic, local `global_sequence_num`.
-                    // Do NOT re-publish to the mesh here to avoid loops.
-                    match event_store_for_mesh.append(vec![event.clone()]).await {
-                        Ok(stored) => {
-                            for e in stored {
-                                let _ = bus_for_mesh.publish(e);
+        let mesh_for_subscribe = app_state.mesh.clone();
+        let bus_for_mesh = app_state.bus.clone();
+        let event_store_for_mesh = app_state.event_store.clone();
+        let limiter_mesh = cluster.task_limiter.clone();
+        limiter_mesh.spawn(async move {
+            let mut incoming = mesh_for_subscribe.subscribe().await;
+            while let Some(result) = incoming.next().await {
+                match result {
+                    Ok(event) => {
+                        // Persist the remote event into the local EventStore so the local
+                        // projections can rely on a monotonic, local `global_sequence_num`.
+                        // Do NOT re-publish to the mesh here to avoid loops.
+                        match event_store_for_mesh.append(vec![event.clone()]).await {
+                            Ok(stored) => {
+                                for e in stored {
+                                    let _ = bus_for_mesh.publish(e);
+                                }
                             }
+                            Err(e) => tracing::warn!("Failed to persist mesh event: {}", e),
                         }
-                        Err(e) => tracing::warn!("Failed to persist mesh event: {}", e),
+                    }
+                    Err(e) => tracing::warn!("Mesh subscribe error: {}", e),
+                }
+            }
+        }).await;
+
+        // Wait for quorum before starting the server (optional but recommended for split-brain prevention)
+        tracing::info!("Waiting for cluster quorum...");
+        let mut quorum_retries = 0;
+        while let Err(e) = app_state.mesh.check_quorum().await {
+            quorum_retries += 1;
+            if quorum_retries % 5 == 0 {
+                tracing::warn!("Still waiting for quorum: {}", e);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if quorum_retries >= 30 {
+                tracing::warn!("Starting without quorum after 30s timeout");
+                break;
+            }
+        }
+        tracing::info!("Quorum check passed, starting API server...");
+
+        let app = Router::new()
+            .route("/todos", axum::routing::get(get_todos).post(create_todo))
+            .route("/todos/{id}/complete", put(complete_todo))
+            .route("/todos/{id}", delete(delete_todo))
+            .with_state(app_state);
+
+        let addr: SocketAddr = listen_addr.parse()?;
+        let listener = TcpListener::bind(addr).await?;
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("Failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("Received SIGINT, shutting down...");
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("Received SIGTERM, shutting down...");
                     }
                 }
-                Err(e) => tracing::warn!("Mesh subscribe error: {}", e),
-            }
-        }
-    });
+            })
+            .await?;
 
-    // Wait for quorum before starting the server (optional but recommended for split-brain prevention)
-    tracing::info!("Waiting for cluster quorum...");
-    let mut quorum_retries = 0;
-    while let Err(e) = app_state.mesh.check_quorum().await {
-        quorum_retries += 1;
-        if quorum_retries % 5 == 0 {
-            tracing::warn!("Still waiting for quorum: {}", e);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if quorum_retries >= 30 {
-            tracing::warn!("Starting without quorum after 30s timeout");
-            break;
-        }
-    }
-    tracing::info!("Quorum check passed, starting API server...");
-
-    let app = Router::new()
-        .route("/todos", axum::routing::get(get_todos).post(create_todo))
-        .route("/todos/{id}/complete", put(complete_todo))
-        .route("/todos/{id}", delete(delete_todo))
-        .with_state(app_state);
-
-    let addr: SocketAddr = listen_addr.parse()?;
-    let listener = TcpListener::bind(addr).await?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("Failed to install SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Received SIGINT, shutting down...");
-                }
-                _ = sigterm.recv() => {
-                    tracing::info!("Received SIGTERM, shutting down...");
-                }
-            }
-        })
-        .await?;
-
-    Ok(())
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
 }

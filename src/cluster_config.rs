@@ -9,6 +9,8 @@ pub struct ClusterConfig {
     pub data_dir: String,
     pub node_id: Option<Uuid>,
     pub dns_query: Option<String>,
+    pub worker_threads: usize,
+    pub max_concurrent_tasks: usize,
 }
 
 impl ClusterConfig {
@@ -43,6 +45,22 @@ impl ClusterConfig {
 
         let dns_query = std::env::var("DNS_QUERY").ok();
 
+        let worker_threads = std::env::var("WORKER_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2); // Raspberry Pi preference: fewer cores often perform better under K8s limits
+
+        let max_concurrent_tasks = std::env::var("MAX_CONCURRENT_TASKS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                if cfg!(target_arch = "aarch64") {
+                    50
+                } else {
+                    1000 // Default for more powerful architectures
+                }
+            });
+
         ClusterConfig {
             port,
             mesh_port,
@@ -52,6 +70,8 @@ impl ClusterConfig {
             data_dir,
             node_id,
             dns_query,
+            worker_threads,
+            max_concurrent_tasks,
         }
     }
 

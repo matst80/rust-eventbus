@@ -67,6 +67,7 @@ pub async fn default_mesh<E>(
     listen_addr: String,
     advertised_addr: String,
     discovery: std::sync::Arc<dyn NodeDiscovery>,
+    task_limiter: Option<crate::task_limiter::TaskLimiter>,
 ) -> std::sync::Arc<dyn DistributedPubSub<E>>
 where
     E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
@@ -90,12 +91,19 @@ where
     }
 
     // Default: TcpPubSub
-    std::sync::Arc::new(TcpPubSub::new_with_advertised_addr(
+    let mesh = TcpPubSub::new_with_advertised_addr(
         node_id,
         listen_addr,
         advertised_addr,
         discovery,
-    ))
+    );
+    let mesh = if let Some(l) = task_limiter {
+        mesh.with_task_limiter(l)
+    } else {
+        mesh
+    };
+    mesh.start_background_manager().await;
+    std::sync::Arc::new(mesh)
 }
 
 #[async_trait]
@@ -312,6 +320,7 @@ pub struct TcpPubSub<E: EventPayload> {
     discovery: Arc<dyn NodeDiscovery>,
     discovery_cache: Arc<parking_lot::Mutex<(std::time::Instant, Vec<Node>)>>,
     connections: Arc<Mutex<HashMap<String, tokio::net::TcpStream>>>,
+    task_limiter: Option<crate::task_limiter::TaskLimiter>,
     _phantom: std::marker::PhantomData<E>,
 }
 
@@ -336,24 +345,28 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 vec![],
             ))),
-            connections: connections.clone(),
+            connections,
+            task_limiter: None,
             _phantom: std::marker::PhantomData,
         };
 
-        // Proactive Connection Manager: Fixes quorum-on-startup chicken-and-egg problem.
-        // Periodically ensures we have connections to all discovered peers.
-        let discovery_cache = mesh.discovery_cache.clone();
-        let discovery_inner = discovery.clone();
-        let advertised_addr_inner = advertised_addr.clone();
-        tokio::spawn(async move {
-            loop {
-                // Refresh nodes
-                if let Ok(nodes) = discovery_inner.discover_nodes().await {
-                    {
-                        let mut cache = discovery_cache.lock();
-                        *cache = (std::time::Instant::now(), nodes.clone());
-                    }
+        mesh
+    }
 
+    pub fn with_task_limiter(mut self, limiter: crate::task_limiter::TaskLimiter) -> Self {
+        self.task_limiter = Some(limiter);
+        self
+    }
+    
+    pub async fn start_background_manager(&self) {
+        let discovery_inner = self.discovery.clone();
+        let advertised_addr_inner = self.advertised_addr.clone();
+        let limiter = self.task_limiter.clone();
+        let connections = self.connections.clone();
+        
+        let manager_task = async move {
+            loop {
+                if let Ok(nodes) = discovery_inner.discover_nodes().await {
                     for node in nodes {
                         if same_endpoint(&node.address, &advertised_addr_inner) {
                             continue;
@@ -362,15 +375,14 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
                         let addr = node.address.clone();
                         let conns = connections.clone();
 
-                        // Only connect if we don't already have an active stream
                         let has_conn = {
                             let c = conns.lock().await;
                             c.contains_key(&addr)
                         };
 
                         if !has_conn {
-                            tokio::spawn(async move {
-                                if let Ok(Ok(mut s)) = tokio::time::timeout(
+                            let task = async move {
+                                if let Ok(Ok(s)) = tokio::time::timeout(
                                     std::time::Duration::from_secs(2),
                                     tokio::net::TcpStream::connect(&addr),
                                 )
@@ -380,15 +392,46 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
                                     let mut c = conns.lock().await;
                                     c.insert(addr, s);
                                 }
-                            });
+                            };
+                            if let Some(l) = limiter.as_ref() {
+                                l.spawn(task).await;
+                            } else {
+                                tokio::spawn(task);
+                            }
                         }
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-        });
+        };
 
-        mesh
+        if let Some(l) = self.task_limiter.clone() {
+            let _ = tokio::spawn(async move { l.spawn(manager_task).await });
+        } else {
+            tokio::spawn(manager_task);
+        }
+    }
+
+    async fn get_nodes(&self) -> Result<Vec<Node>, DistributedError> {
+        let cached = {
+            let cache = self.discovery_cache.lock();
+            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
+                Some(cache.1.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(n) = cached {
+            return Ok(n);
+        }
+
+        let n = self.discovery.discover_nodes().await?;
+        {
+            let mut cache = self.discovery_cache.lock();
+            *cache = (std::time::Instant::now(), n.clone());
+        }
+        Ok(n)
     }
 }
 
@@ -415,6 +458,7 @@ pub struct TcpPubSubBackend {
     discovery: Arc<dyn NodeDiscovery>,
     discovery_cache: Arc<parking_lot::Mutex<(std::time::Instant, Vec<Node>)>>,
     connections: Arc<Mutex<HashMap<String, tokio::net::TcpStream>>>,
+    task_limiter: Option<crate::task_limiter::TaskLimiter>,
 }
 
 impl TcpPubSubBackend {
@@ -438,7 +482,13 @@ impl TcpPubSubBackend {
                 vec![],
             ))),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            task_limiter: None,
         }
+    }
+
+    pub fn with_task_limiter(mut self, limiter: crate::task_limiter::TaskLimiter) -> Self {
+        self.task_limiter = Some(limiter);
+        self
     }
 
     async fn get_nodes(&self) -> Result<Vec<Node>, DistributedError> {
@@ -488,11 +538,12 @@ impl PubSubBackend for TcpPubSubBackend {
                 continue;
             }
 
-            let addr = node.address.clone();
             let payload = payload_arc.clone();
             let conns = conns_ref.clone();
+            let limiter = self.task_limiter.clone();
+            let addr = node.address.clone();
 
-            tokio::spawn(async move {
+            let task = async move {
                 let stream = {
                     let mut c = conns.lock().await;
                     c.remove(&addr)
@@ -525,7 +576,13 @@ impl PubSubBackend for TcpPubSubBackend {
                         _ => {}
                     }
                 }
-            });
+            };
+
+            if let Some(l) = limiter {
+                l.spawn(task).await;
+            } else {
+                tokio::spawn(task);
+            }
             tokio::task::yield_now().await;
         }
 
@@ -534,14 +591,12 @@ impl PubSubBackend for TcpPubSubBackend {
 
     async fn check_quorum(&self) -> Result<(), DistributedError> {
         let nodes = self.get_nodes().await?;
-        // If we only see 1 node total, quorum is reached by definition (single node cluster)
         if nodes.len() <= 1 {
             return Ok(());
         }
 
         let min_required = (nodes.len() / 2) + 1;
         
-        // Count active connections + self
         let active_nodes = {
             let conns = self.connections.lock().await;
             conns.len() + 1
@@ -563,7 +618,8 @@ impl PubSubBackend for TcpPubSubBackend {
         let my_node_id = self.node_id;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
-        tokio::spawn(async move {
+        let limiter = self.task_limiter.clone();
+        let listener_task = async move {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
@@ -577,7 +633,8 @@ impl PubSubBackend for TcpPubSubBackend {
                     Ok((mut socket, _peer_addr)) => {
                         let tx = tx.clone();
                         let my_node_id = my_node_id;
-                        tokio::spawn(async move {
+                        let limiter_inner = limiter.clone();
+                        let peer_task = async move {
                             let mut len_buf = [0u8; 4];
                             use tokio::io::AsyncReadExt;
 
@@ -613,15 +670,26 @@ impl PubSubBackend for TcpPubSubBackend {
                                 }
                                 tokio::task::yield_now().await;
                             }
-                        });
+                        };
+                        if let Some(l) = limiter_inner {
+                            l.spawn(peer_task).await;
+                        } else {
+                            tokio::spawn(peer_task);
+                        }
                     }
                     Err(e) => {
-                        tracing::error!("accept error: {}", e);
+                        tracing::error!("accept error from {}: {}", addr, e);
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
-        });
+        };
+
+        if let Some(l) = self.task_limiter.clone() {
+            let _ = tokio::spawn(async move { l.spawn(listener_task).await });
+        } else {
+            tokio::spawn(listener_task);
+        }
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
@@ -661,16 +729,16 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         let conns_ref = self.connections.clone();
 
         for node in nodes {
-            // Self-filter check (ip-based as fallback for nil-id discovery)
             if same_endpoint(&node.address, &my_addr) {
                 continue;
             }
 
-            let addr = node.address;
+            let addr = node.address.clone();
             let payload = payload_arc.clone();
             let conns = conns_ref.clone();
+            let limiter = self.task_limiter.clone();
 
-            tokio::spawn(async move {
+            let task = async move {
                 let stream = {
                     let mut c = conns.lock().await;
                     c.remove(&addr)
@@ -711,8 +779,13 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                         }
                     }
                 }
-            });
-            tokio::task::yield_now().await;
+            };
+
+            if let Some(l) = limiter {
+                l.spawn(task).await;
+            } else {
+                tokio::spawn(task);
+            }
         }
         Ok(())
     }
@@ -743,7 +816,8 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         let my_node_id = self.node_id;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
-        tokio::spawn(async move {
+        let limiter = self.task_limiter.clone();
+        let listener_task = async move {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => {
                     tracing::info!("Mesh listening on {} (Node: {})", addr, my_node_id);
@@ -760,7 +834,8 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                     Ok((mut socket, peer_addr)) => {
                         let tx = tx.clone();
                         let my_node_id = my_node_id;
-                        tokio::spawn(async move {
+                        let limiter_inner = limiter.clone();
+                        let peer_task = async move {
                             tracing::trace!("Mesh connection from {}", peer_addr);
                             let mut len_buf = [0u8; 4];
                             use tokio::io::AsyncReadExt;
@@ -770,65 +845,47 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                                     Ok(_) => {
                                         let body_len = u32::from_be_bytes(len_buf) as usize;
                                         if body_len > 10 * 1024 * 1024 {
-                                            tracing::error!(
-                                                "Oversized packet: {} from {}",
-                                                body_len,
-                                                peer_addr
-                                            );
+                                            tracing::error!("Oversized packet: {} from {}", body_len, peer_addr);
                                             break;
                                         }
 
                                         let mut body = vec![0u8; body_len];
                                         if let Err(e) = socket.read_exact(&mut body).await {
-                                            tracing::error!(
-                                                "Body read error from {}: {}",
-                                                peer_addr,
-                                                e
-                                            );
+                                            tracing::error!("Body read error from {}: {}", peer_addr, e);
                                             break;
                                         }
 
-                                        if body.len() < 16 {
-                                            continue;
-                                        }
+                                        if body.len() < 16 { continue; }
                                         let mut id_bytes = [0u8; 16];
                                         id_bytes.copy_from_slice(&body[..16]);
                                         let sender_id = Uuid::from_bytes(id_bytes);
 
-                                        if sender_id == my_node_id {
-                                            continue;
-                                        }
+                                        if sender_id == my_node_id { continue; }
 
-                                        match bincode::deserialize::<Event<E>>(&body[16..]) {
+                                        let event_payload = body[16..].to_vec();
+                                        match bincode::deserialize::<Event<E>>(&event_payload) {
                                             Ok(event) => {
-                                                tracing::info!(
-                                                    "Mesh IN: Event {} (from Peer {})",
-                                                    event.id,
-                                                    sender_id
-                                                );
+                                                tracing::info!("Mesh IN: Event {} (from Peer {})", event.id, sender_id);
                                                 let _ = tx.send(Ok(event)).await;
                                             }
-                                            Err(e) => tracing::error!(
-                                                "Bincode error from {}: {}",
-                                                peer_addr,
-                                                e
-                                            ),
+                                            Err(e) => tracing::error!("Bincode error from {}: {}", peer_addr, e),
                                         }
                                     }
                                     Err(e) => {
                                         if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                                            tracing::debug!(
-                                                "Mesh connection closed by {}: {}",
-                                                peer_addr,
-                                                e
-                                            );
+                                            tracing::debug!("Mesh connection closed by {}: {}", peer_addr, e);
                                         }
                                         break;
                                     }
                                 }
                                 tokio::task::yield_now().await;
                             }
-                        });
+                        };
+                        if let Some(l) = limiter_inner {
+                            l.spawn(peer_task).await;
+                        } else {
+                            tokio::spawn(peer_task);
+                        }
                     }
                     Err(e) => {
                         tracing::error!("Mesh accept error: {}", e);
@@ -837,33 +894,15 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
                 }
                 tokio::task::yield_now().await;
             }
-        });
-
-        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
-    }
-}
-
-impl<E: EventPayload> TcpPubSub<E> {
-    async fn get_nodes(&self) -> Result<Vec<Node>, DistributedError> {
-        let cached = {
-            let cache = self.discovery_cache.lock();
-            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
-                Some(cache.1.clone())
-            } else {
-                None
-            }
         };
 
-        if let Some(n) = cached {
-            return Ok(n);
+        if let Some(l) = self.task_limiter.clone() {
+            let _ = tokio::spawn(async move { l.spawn(listener_task).await });
+        } else {
+            tokio::spawn(listener_task);
         }
 
-        let n = self.discovery.discover_nodes().await?;
-        {
-            let mut cache = self.discovery_cache.lock();
-            *cache = (std::time::Instant::now(), n.clone());
-        }
-        Ok(n)
+        Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
 

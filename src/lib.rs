@@ -12,6 +12,7 @@ pub mod libp2p_adapter;
 pub mod libp2p_swarm;
 pub mod projection;
 pub mod store;
+pub mod task_limiter;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};

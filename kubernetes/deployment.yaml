@@ -52,6 +52,14 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+        - name: WORKER_THREADS
+          value: "2"
+        resources:
+          limits:
+            memory: "512Mi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
         readinessProbe:
           tcpSocket:
             port: 3001
