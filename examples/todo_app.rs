@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use rust_eventbus::{
     bus::EventBus,
-    distributed::{DistributedPubSub},
+    distributed::DistributedPubSub,
     event::{Event, EventPayload},
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
     store::{CompactionRule, EventStore, FileEventStore},

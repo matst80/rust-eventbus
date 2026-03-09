@@ -175,8 +175,8 @@ impl FileEventStore {
         Ok(Self {
             file_path,
             inner: Arc::new(Mutex::new(FileInnerState {
-                next_global_seq,
                 tx,
+                next_global_seq,
                 id_index,
             })),
         })
@@ -289,7 +289,7 @@ where
                     }
                 }
 
-                let mut reader = state.expect("State should not be None");
+                let mut reader = state.unwrap();
                 loop {
                     let mut len_buf = [0u8; 4];
                     match reader.read_exact(&mut len_buf).await {

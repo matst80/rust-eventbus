@@ -1,11 +1,14 @@
-use crate::distributed::{DnsNodeDiscovery, EnvironmentNodeDiscovery, NodeDiscovery, ProjectionLockManager, DistributedPubSub};
-use crate::store::{FileEventStore, FileSnapshotStore};
+use crate::distributed::{
+    DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, NodeDiscovery,
+    ProjectionLockManager,
+};
 use crate::event::EventPayload;
-use std::sync::Arc;
-use uuid::Uuid;
+use crate::store::{FileEventStore, FileSnapshotStore};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 /// File-based lease lock manager used by examples/apps to coordinate durable projections.
 pub struct FileLeaseLockManager {
@@ -15,14 +18,20 @@ pub struct FileLeaseLockManager {
 
 impl FileLeaseLockManager {
     pub fn new(lock_dir: String, lease_ttl: std::time::Duration) -> Self {
-        Self { lock_dir, lease_ttl }
+        Self {
+            lock_dir,
+            lease_ttl,
+        }
     }
 
     fn lock_path(&self, projection_name: &str) -> String {
         format!("{}/{}.lock", self.lock_dir, projection_name)
     }
 
-    async fn read_owner(&self, lock_path: &str) -> Result<Option<Uuid>, crate::distributed::LockError> {
+    async fn read_owner(
+        &self,
+        lock_path: &str,
+    ) -> Result<Option<Uuid>, crate::distributed::LockError> {
         match tokio::fs::read_to_string(lock_path).await {
             Ok(content) => Ok(Uuid::parse_str(content.trim()).ok()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -33,7 +42,9 @@ impl FileLeaseLockManager {
     async fn is_stale(&self, lock_path: &str) -> Result<bool, crate::distributed::LockError> {
         match tokio::fs::metadata(lock_path).await {
             Ok(meta) => {
-                let modified = meta.modified().map_err(|e| crate::distributed::LockError::Storage(e.to_string()))?;
+                let modified = meta
+                    .modified()
+                    .map_err(|e| crate::distributed::LockError::Storage(e.to_string()))?;
                 let age = std::time::SystemTime::now()
                     .duration_since(modified)
                     .unwrap_or_default();
@@ -44,7 +55,11 @@ impl FileLeaseLockManager {
         }
     }
 
-    async fn write_owner(&self, lock_path: &str, node_id: &Uuid) -> Result<(), crate::distributed::LockError> {
+    async fn write_owner(
+        &self,
+        lock_path: &str,
+        node_id: &Uuid,
+    ) -> Result<(), crate::distributed::LockError> {
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -61,7 +76,11 @@ impl FileLeaseLockManager {
 
 #[async_trait::async_trait]
 impl ProjectionLockManager for FileLeaseLockManager {
-    async fn acquire_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<bool, crate::distributed::LockError> {
+    async fn acquire_lock(
+        &self,
+        projection_name: &str,
+        node_id: &Uuid,
+    ) -> Result<bool, crate::distributed::LockError> {
         tokio::fs::create_dir_all(&self.lock_dir)
             .await
             .map_err(|e| crate::distributed::LockError::Storage(e.to_string()))?;
@@ -117,7 +136,11 @@ impl ProjectionLockManager for FileLeaseLockManager {
         Ok(false)
     }
 
-    async fn keep_alive(&self, projection_name: &str, node_id: &Uuid) -> Result<(), crate::distributed::LockError> {
+    async fn keep_alive(
+        &self,
+        projection_name: &str,
+        node_id: &Uuid,
+    ) -> Result<(), crate::distributed::LockError> {
         let lock_path = self.lock_path(projection_name);
         match self.read_owner(&lock_path).await? {
             Some(owner) if owner == *node_id => self.write_owner(&lock_path, node_id).await,
@@ -125,7 +148,11 @@ impl ProjectionLockManager for FileLeaseLockManager {
         }
     }
 
-    async fn release_lock(&self, projection_name: &str, node_id: &Uuid) -> Result<(), crate::distributed::LockError> {
+    async fn release_lock(
+        &self,
+        projection_name: &str,
+        node_id: &Uuid,
+    ) -> Result<(), crate::distributed::LockError> {
         let lock_path = self.lock_path(projection_name);
         if let Some(owner) = self.read_owner(&lock_path).await? {
             if owner != *node_id {
@@ -145,7 +172,8 @@ impl ProjectionLockManager for FileLeaseLockManager {
 }
 
 /// Aggregate of components needed to wire an application node.
-pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> {
+pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>>
+{
     pub node_id: Uuid,
     pub mesh: Arc<dyn DistributedPubSub<E>>,
     pub event_store: Arc<FileEventStore>,
@@ -159,9 +187,9 @@ pub struct ClusterComponents<E: EventPayload + serde::Serialize + for<'de> serde
 }
 /// Initialize cluster-related components from environment variables (DATA_DIR, PORT, MESH_* etc.).
 pub use crate::cluster_config::ClusterConfig;
-pub async fn init_cluster<
-    E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>,
->(config: ClusterConfig) -> Result<ClusterComponents<E>, Box<dyn Error>> {
+pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>>(
+    config: ClusterConfig,
+) -> Result<ClusterComponents<E>, Box<dyn Error>> {
     let _port: u16 = config.port;
 
     let mesh_port: u16 = config.mesh_port;
