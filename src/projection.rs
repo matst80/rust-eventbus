@@ -141,12 +141,8 @@ where
                 let cmd = *cmd_rx.borrow_and_update();
                 match cmd {
                     ProjectionCommand::Reset => {
-                        if let Err(e) = self.snapshot_store.delete(self.projection.name()).await {
-                            eprintln!(
-                                "Failed to delete snapshot for {}: {}",
-                                self.projection.name(),
-                                e
-                            );
+                        if let Err(_e) = self.snapshot_store.delete(self.projection.name()).await {
+                            // Log error if needed, but don't block
                         }
                         let mut state_lock = self.state.write().await;
                         *state_lock = S::default();
@@ -183,23 +179,19 @@ where
                 while let Some(Ok(event)) = stream.next().await {
                     let mut state_lock = self.state.write().await;
                     if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                        current_seq = event.global_sequence_num;
+                        current_seq = current_seq.max(event.global_sequence_num);
                         events_since_snapshot += 1;
                         if let Some(v) = &self.version {
                             v.fetch_add(1, Ordering::Relaxed);
                         }
                         if events_since_snapshot >= self.snapshot_interval {
                             events_since_snapshot = 0;
-                            if let Err(e) = self
+                            if let Err(_e) = self
                                 .snapshot_store
                                 .save(self.projection.name(), current_seq, &*state_lock)
                                 .await
                             {
-                                eprintln!(
-                                    "Failed to save snapshot for {}: {}",
-                                    self.projection.name(),
-                                    e
-                                );
+                                // Log error if needed
                             }
                         }
                     }
@@ -208,17 +200,11 @@ where
                 // Save snapshot after catch-up if there were unsaved events.
                 if events_since_snapshot > 0 {
                     let state_lock = self.state.read().await;
-                    if let Err(e) = self
+                    let _ = self
                         .snapshot_store
                         .save(self.projection.name(), current_seq, &*state_lock)
-                        .await
-                    {
-                        eprintln!(
-                            "Failed to save snapshot after catch-up for {}: {}",
-                            self.projection.name(),
-                            e
-                        );
-                    }
+                        .await;
+                    events_since_snapshot = 0;
                 }
 
                 // 4. Process real-time events
@@ -233,7 +219,7 @@ where
                             if result.is_ok() {
                                 restart = true;
                             }
-                        }
+                        },
                         recv = rx.recv() => {
                             match recv {
                                 Ok(event) => {
@@ -243,7 +229,7 @@ where
                                     let mut state_lock = self.state.write().await;
                                     match self.projection.handle(&mut state_lock, &event).await {
                                         Ok(()) => {
-                                            current_seq = event.global_sequence_num;
+                                            current_seq = current_seq.max(event.global_sequence_num);
                                             events_since_snapshot += 1;
                                             if let Some(v) = &self.version {
                                                 v.fetch_add(1, Ordering::Relaxed);
@@ -271,7 +257,7 @@ where
                                     return; // Bus closed, stop projection
                                 }
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -398,7 +384,7 @@ where
                     while let Some(Ok(event)) = stream.next().await {
                         let mut state_lock = self.state.lock().await;
                         if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                            current_seq = event.global_sequence_num;
+                            current_seq = current_seq.max(event.global_sequence_num);
                             events_since_snapshot += 1;
                             if let Some(v) = &self.version {
                                 v.fetch_add(1, Ordering::Relaxed);
@@ -432,6 +418,7 @@ where
                                 e
                             );
                         }
+                        events_since_snapshot = 0;
                     }
 
                     // Process live events
@@ -455,7 +442,7 @@ where
                                 if result.is_ok() {
                                     restart = true;
                                 }
-                            }
+                            },
                             recv = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()) => {
                                 match recv {
                                     Ok(Ok(event)) => {
@@ -463,17 +450,22 @@ where
                                             continue;
                                         }
                                         let mut state_lock = self.state.lock().await;
-                                        if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                                            current_seq = event.global_sequence_num;
-                                            events_since_snapshot += 1;
-                                            if let Some(v) = &self.version {
-                                                v.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            if events_since_snapshot >= self.snapshot_interval {
-                                                events_since_snapshot = 0;
-                                                if let Err(e) = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await {
-                                                    eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
+                                        match self.projection.handle(&mut state_lock, &event).await {
+                                            Ok(()) => {
+                                                current_seq = current_seq.max(event.global_sequence_num);
+                                                events_since_snapshot += 1;
+                                                if let Some(v) = &self.version {
+                                                    v.fetch_add(1, Ordering::Relaxed);
                                                 }
+                                                if events_since_snapshot >= self.snapshot_interval {
+                                                    events_since_snapshot = 0;
+                                                    if let Err(e) = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await {
+                                                        eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Durable projection {} failed to process event: {}", self.projection.name(), e);
                                             }
                                         }
                                     }
@@ -488,7 +480,7 @@ where
                                         // Timeout for keep_alive heartbeat
                                     }
                                 }
-                            }
+                            },
                         }
                         tokio::task::yield_now().await;
                     }

@@ -91,7 +91,7 @@ pub struct FileEventStore {
 
 struct FileInnerState {
     next_global_seq: u64,
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<(Vec<u8>, Option<tokio::sync::oneshot::Sender<()>>)>,
     /// In-memory index of event id -> global_sequence_num to provide idempotent appends.
     id_index: HashMap<Uuid, u64>,
 }
@@ -137,36 +137,44 @@ impl FileEventStore {
             .open(&file_path)
             .await?;
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, Option<tokio::sync::oneshot::Sender<()>>)>(1024);
 
         // Spawn a background worker to handle file writes asynchronously.
         tokio::spawn(async move {
             let mut file = file;
-            'outer: while let Some(buffer) = rx.recv().await {
+            while let Some((buffer, sync_tx)) = rx.recv().await {
                 let mut needs_sync = buffer.is_empty();
+                let mut sync_waiters = Vec::new();
+                if let Some(stx) = sync_tx {
+                    sync_waiters.push(stx);
+                }
+
                 if !buffer.is_empty() {
                     if let Err(e) = file.write_all(&buffer).await {
                         eprintln!("EventStore background writer failed: {}", e);
-                        break 'outer;
+                        break;
                     }
                 }
 
                 // ⚡ Bolt Optimization: Batch I/O writes and fsync requests
-                // Instead of processing one buffer and immediately fsync-ing if requested,
-                // we greedily drain the channel using `try_recv()`. This batches multiple
-                // concurrent `append` calls into a single disk synchronization, reducing
-                // I/O overhead and significantly improving throughput (e.g. 10x faster appends).
-                while let Ok(next_buffer) = rx.try_recv() {
+                while let Ok((next_buffer, next_sync_tx)) = rx.try_recv() {
+                    if let Some(stx) = next_sync_tx {
+                        sync_waiters.push(stx);
+                    }
                     if next_buffer.is_empty() {
                         needs_sync = true;
                     } else if let Err(e) = file.write_all(&next_buffer).await {
                         eprintln!("EventStore background writer failed: {}", e);
-                        break 'outer;
+                        break;
                     }
                 }
 
-                if needs_sync {
+                if needs_sync || !sync_waiters.is_empty() {
                     let _ = file.sync_data().await;
+                    eprintln!("DEBUG: EventStore synced to disk");
+                    for stx in sync_waiters {
+                        let _ = stx.send(());
+                    }
                 }
             }
             let _ = file.sync_all().await;
@@ -253,18 +261,18 @@ where
             buffer.extend_from_slice(&bytes);
         }
 
-        // Only send a write if there's new data to persist. Always send a flush sentinel
-        // to ensure durability ordering for callers.
+        // Only send a write if there's new data to persist.
         if !buffer.is_empty() {
+            let (sync_tx, sync_rx) = tokio::sync::oneshot::channel();
             inner
                 .tx
-                .send(buffer)
+                .send((buffer, Some(sync_tx)))
                 .await
                 .map_err(|_| StoreError::Other("Background writer closed".into()))?;
-        }
 
-        // Flush to ensure data is available for reads immediately after append.
-        inner.tx.send(vec![]).await.ok(); // no-op flush sentinel; harmless if writer is gone
+            // Await synchronization for durability
+            let _ = sync_rx.await;
+        }
 
         Ok(events)
     }
@@ -411,9 +419,13 @@ where
         match tokio::fs::read(&path).await {
             Ok(content) => {
                 let env: SnapshotEnvelope<S> = bincode::deserialize(&content)?;
+                eprintln!("DEBUG: SnapshotStore loaded {} at seq {}", projection_name, env.sequence_num);
                 Ok(Some((env.sequence_num, env.state)))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("DEBUG: SnapshotStore found no snapshot for {}", projection_name);
+                Ok(None)
+            }
             Err(e) => Err(StoreError::Io(e)),
         }
     }
@@ -443,6 +455,7 @@ where
         tmp_file.sync_data().await?;
 
         tokio::fs::rename(tmp_path, path).await?;
+        eprintln!("DEBUG: SnapshotStore saved {} at seq {}", projection_name, sequence_num);
         Ok(())
     }
 

@@ -1,0 +1,10 @@
+target/
+frontend/node_modules/
+dist/
+.git/
+.env
+data/
+todo_snapshots_cluster/
+tmp/
+*.log
+.DS_Store

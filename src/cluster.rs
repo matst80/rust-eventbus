@@ -208,10 +208,11 @@ pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::D
         Arc::new(EnvironmentNodeDiscovery::new())
     };
 
-    tokio::fs::create_dir_all(&data_dir).await?;
+    let node_data_dir = format!("{}/node_{}", data_dir, node_id);
+    tokio::fs::create_dir_all(&node_data_dir).await?;
 
-    let event_store_path = format!("{}/events.bin", data_dir);
-    let snapshot_store_path = format!("{}/snapshots", data_dir);
+    let event_store_path = format!("{}/events.bin", node_data_dir);
+    let snapshot_store_path = format!("{}/snapshots", node_data_dir);
 
     let event_store = Arc::new(FileEventStore::new(&event_store_path).await?);
     let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_store_path).await?);
