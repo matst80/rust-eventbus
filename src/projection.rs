@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::{
     bus::EventBus,
@@ -70,7 +70,7 @@ pub struct EphemeralProjectionActor<E: EventPayload, S, P, SS, ES> {
     event_store: Arc<ES>,
     projection: Arc<P>,
     snapshot_store: Arc<SS>,
-    state: Arc<Mutex<S>>,
+    state: Arc<RwLock<S>>,
     snapshot_interval: u64,
     cmd_tx: watch::Sender<ProjectionCommand>,
     cmd_rx: watch::Receiver<ProjectionCommand>,
@@ -98,7 +98,7 @@ where
             event_store,
             projection,
             snapshot_store,
-            state: Arc::new(Mutex::new(S::default())),
+            state: Arc::new(RwLock::new(S::default())),
             snapshot_interval: 100,
             cmd_tx,
             cmd_rx,
@@ -120,7 +120,7 @@ where
     }
 
     /// Returns a reference-counted lock to the underlying projection state.
-    pub fn get_state(&self) -> Arc<Mutex<S>> {
+    pub fn get_state(&self) -> Arc<RwLock<S>> {
         Arc::clone(&self.state)
     }
 
@@ -148,11 +148,11 @@ where
                                 e
                             );
                         }
-                        let mut state_lock = self.state.lock().await;
+                        let mut state_lock = self.state.write().await;
                         *state_lock = S::default();
                     }
                     ProjectionCommand::Replay => {
-                        let mut state_lock = self.state.lock().await;
+                        let mut state_lock = self.state.write().await;
                         *state_lock = S::default();
                     }
                     ProjectionCommand::Run => {}
@@ -168,7 +168,7 @@ where
                     if let Ok(Some((seq, loaded_state))) =
                         self.snapshot_store.load(self.projection.name()).await
                     {
-                        let mut state_lock = self.state.lock().await;
+                        let mut state_lock = self.state.write().await;
                         *state_lock = loaded_state;
                         current_seq = seq;
                     }
@@ -181,7 +181,7 @@ where
                 // 3. Catch up from EventStore
                 let mut stream = self.event_store.read_all_from(current_seq + 1);
                 while let Some(Ok(event)) = stream.next().await {
-                    let mut state_lock = self.state.lock().await;
+                    let mut state_lock = self.state.write().await;
                     if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
                         current_seq = event.global_sequence_num;
                         events_since_snapshot += 1;
@@ -207,7 +207,7 @@ where
                 }
                 // Save snapshot after catch-up if there were unsaved events.
                 if events_since_snapshot > 0 {
-                    let state_lock = self.state.lock().await;
+                    let state_lock = self.state.read().await;
                     if let Err(e) = self
                         .snapshot_store
                         .save(self.projection.name(), current_seq, &*state_lock)
@@ -240,7 +240,7 @@ where
                                     if event.global_sequence_num <= current_seq && event.global_sequence_num != 0 {
                                         continue;
                                     }
-                                    let mut state_lock = self.state.lock().await;
+                                    let mut state_lock = self.state.write().await;
                                     match self.projection.handle(&mut state_lock, &event).await {
                                         Ok(()) => {
                                             current_seq = event.global_sequence_num;

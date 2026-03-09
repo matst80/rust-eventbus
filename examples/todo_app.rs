@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{delete, put},
     Json, Router,
 };
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rust_eventbus::{
@@ -156,7 +158,7 @@ struct AppState {
     bus: EventBus<TodoEvent>,
     mesh: Arc<dyn DistributedPubSub<TodoEvent>>,
     event_store: Arc<FileEventStore>,
-    projection_state: Arc<tokio::sync::Mutex<TodoState>>,
+    projection_state: Arc<RwLock<TodoState>>,
     projection_version: Arc<AtomicU64>,
 }
 
@@ -165,11 +167,24 @@ struct AppState {
 async fn get_todos(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
-) -> Result<(axum::http::HeaderMap, Json<Vec<TodoItem>>), StatusCode> {
+) -> impl IntoResponse {
     let version = state.projection_version.load(Ordering::Relaxed);
     let etag = format!("\"{}\"", version);
 
-    let proj = state.projection_state.lock().await;
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        "max-age=0, must-revalidate".parse().unwrap(),
+    );
+
+    if let Some(if_none_match) = request.headers().get(axum::http::header::IF_NONE_MATCH) {
+        if if_none_match.to_str().map_or(false, |v| v == etag) {
+            return (StatusCode::NOT_MODIFIED, headers).into_response();
+        }
+    }
+
+    let proj = state.projection_state.read().await;
     let mut todos: Vec<TodoItem> = Vec::with_capacity(proj.order.len());
     for id in proj.order.iter() {
         if let Some(item) = proj.todos.get(id) {
@@ -177,16 +192,7 @@ async fn get_todos(
         }
     }
 
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(axum::http::header::ETAG, etag.parse().unwrap());
-
-    if let Some(if_none_match) = request.headers().get(axum::http::header::IF_NONE_MATCH) {
-        if if_none_match.to_str().map_or(false, |v| v == etag) {
-            return Ok((headers, Json(todos)));
-        }
-    }
-
-    Ok((headers, Json(todos)))
+    (headers, Json(todos)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -294,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = rust_eventbus::cluster::ClusterConfig::from_env();
     let port = config.port;
     let host = config.host.clone();
-    let mesh_bind_host = config.mesh_bind_host.clone();
+    let _mesh_bind_host = config.mesh_bind_host.clone();
 
     let cluster = rust_eventbus::cluster::init_cluster::<TodoEvent>(config).await?;
     let node_id = cluster.node_id;

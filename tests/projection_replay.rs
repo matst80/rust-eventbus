@@ -97,7 +97,7 @@ async fn test_projection_replay() {
 
     // Verify initial state
     {
-        let s = state.lock().await;
+        let s = state.read().await;
         assert_eq!(s.count, 3, "After 3 increments, count should be 3");
     }
 
@@ -106,7 +106,7 @@ async fn test_projection_replay() {
     sleep(Duration::from_millis(200)).await;
 
     {
-        let s = state.lock().await;
+        let s = state.read().await;
         assert_eq!(s.count, 3, "After replay, count should still be 3");
     }
 
@@ -146,7 +146,7 @@ async fn test_projection_reset() {
     sleep(Duration::from_millis(200)).await;
 
     {
-        let s = state.lock().await;
+        let s = state.read().await;
         assert_eq!(s.count, 2);
     }
 
@@ -160,7 +160,7 @@ async fn test_projection_reset() {
     sleep(Duration::from_millis(200)).await;
 
     {
-        let s = state.lock().await;
+        let s = state.read().await;
         assert_eq!(s.count, 2, "After reset+replay, count should still be 2");
     }
 
@@ -205,7 +205,7 @@ async fn test_snapshot_interval() {
     sleep(Duration::from_millis(200)).await;
 
     {
-        let s = state.lock().await;
+        let s = state.read().await;
         assert_eq!(s.count, 5);
     }
 
