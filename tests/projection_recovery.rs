@@ -2,11 +2,10 @@ use rust_eventbus::{
     bus::EventBus,
     event::{Event, EventPayload},
     projection::{EphemeralProjectionActor, Projection, ProjectionError},
-    store::{EventStore, FileEventStore, FileSnapshotStore, SnapshotStore},
+    store::{EventStore, FileEventStore, FileSnapshotStore},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct TestEvent {
@@ -26,13 +25,12 @@ struct TestState {
 
 struct TestProjection;
 
-#[async_trait::async_trait]
 impl Projection<TestEvent, TestState> for TestProjection {
     fn name(&self) -> &'static str {
         "test_proj"
     }
 
-    async fn handle(
+    fn handle(
         &self,
         state: &mut TestState,
         event: &Event<TestEvent>,
@@ -69,13 +67,13 @@ async fn test_projection_recovery_and_no_regression() {
     .with_snapshot_interval(1); // snapshot every event
 
     let state = actor.get_state();
-    let handle = actor.spawn().await;
+    let _handle = actor.spawn().await;
 
     // Wait for catch-up
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     {
-        let s = state.read().await;
+        let s = state.read();
         assert_eq!(s.received.len(), 2);
         assert_eq!(s.received[0], "e1");
         assert_eq!(s.received[1], "e2");
@@ -102,7 +100,7 @@ async fn test_projection_recovery_and_no_regression() {
     // Give it time to load snapshot and catch up
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     {
-        let s = state2.read().await;
+        let s = state2.read();
         // Should have e1, e2 (from snapshot/catch-up) and e3 (from file catch-up)
         assert_eq!(s.received.len(), 3, "Actor 2 should have 3 events after catch-up");
         assert_eq!(s.received[2], "e3");
@@ -171,7 +169,7 @@ async fn test_projection_no_sequence_regression() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     {
-        let s = state.read().await;
+        let s = state.read();
         // Even though seq 1 was later in the file, it shouldn't have corrupted current_seq
         // Wait, TestProjection pushes to Vec, so it WILL have both events in the Vec
         // BUT current_seq should remain at 2.
@@ -195,7 +193,7 @@ async fn test_projection_no_sequence_regression() {
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     {
-        let s = state2.read().await;
+        let s = state2.read();
         // Should have loaded snapshot at 2.
         // Catch-up from 3 should find nothing.
         // Total should be 2 events.

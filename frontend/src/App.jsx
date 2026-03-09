@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { 
   CheckCircle2, 
   Circle, 
@@ -12,69 +13,65 @@ import {
   ExternalLink
 } from 'lucide-react';
 
+const fetchTodos = async () => {
+  const response = await fetch('/api/todos');
+  if (!response.ok) throw new Error('Failed to fetch todos');
+  return response.json();
+};
+
 function App() {
-  const [todos, setTodos] = useState([]);
+  const queryClient = useQueryClient();
   const [newTodo, setNewTodo] = useState('');
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState(null);
 
-  const fetchTodos = async () => {
-    try {
-      const response = await fetch('/api/todos');
-      if (!response.ok) throw new Error('Failed to fetch todos');
-      const data = await response.json();
-      setTodos(data);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const { data: todos = [], isLoading, error } = useQuery({
+    queryKey: ['todos'],
+    queryFn: fetchTodos,
+  });
 
-  useEffect(() => {
-    fetchTodos();
-  }, []);
-
-  const addTodo = async (e) => {
-    e.preventDefault();
-    if (!newTodo.trim()) return;
-
-    try {
+  const addMutation = useMutation({
+    mutationFn: async (title) => {
       const response = await fetch('/api/todos', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: newTodo }),
+        body: JSON.stringify({ title }),
       });
       if (!response.ok) throw new Error('Failed to add todo');
+      return response.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
       setNewTodo('');
-      fetchTodos();
-    } catch (err) {
-      setError(err.message);
-    }
-  };
+    },
+  });
 
-  const toggleTodo = async (id) => {
-    try {
+  const toggleMutation = useMutation({
+    mutationFn: async (id) => {
       const response = await fetch(`/api/todos/${id}/complete`, {
         method: 'PUT',
       });
       if (!response.ok) throw new Error('Failed to complete todo');
-      fetchTodos();
-    } catch (err) {
-      setError(err.message);
-    }
-  };
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
 
-  const deleteTodo = async (id) => {
-    try {
+  const deleteMutation = useMutation({
+    mutationFn: async (id) => {
       const response = await fetch(`/api/todos/${id}`, {
         method: 'DELETE',
       });
       if (!response.ok) throw new Error('Failed to delete todo');
-      fetchTodos();
-    } catch (err) {
-      setError(err.message);
-    }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+
+  const handleAddTodo = (e) => {
+    e.preventDefault();
+    if (!newTodo.trim()) return;
+    addMutation.mutate(newTodo);
   };
 
   const openTodos = todos.filter(t => !t.completed);
@@ -100,7 +97,7 @@ function App() {
 
       <main className="max-w-4xl mx-auto mt-10 px-4">
         {/* Input Section */}
-        <form onSubmit={addTodo} className="mb-8 flex gap-2">
+        <form onSubmit={handleAddTodo} className="mb-8 flex gap-2">
           <input
             type="text"
             value={newTodo}
@@ -110,16 +107,22 @@ function App() {
           />
           <button
             type="submit"
-            className="bg-github-success hover:bg-opacity-90 text-white font-medium px-4 py-2 rounded-md flex items-center gap-2 transition-colors shadow-sm"
+            disabled={addMutation.isPending || !newTodo.trim()}
+            className="bg-github-success hover:bg-opacity-90 text-white font-medium px-4 py-2 rounded-md flex items-center gap-2 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Plus size={18} /> New Todo
+            {addMutation.isPending ? (
+              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+            ) : (
+              <Plus size={18} />
+            )}
+            New Todo
           </button>
         </form>
 
         {error && (
           <div className="bg-red-900/20 border border-red-500/50 text-red-200 px-4 py-3 rounded-md mb-6 flex items-center gap-3">
             <Info size={18} />
-            <p>{error}</p>
+            <p>{error.message}</p>
           </div>
         )}
 
@@ -168,8 +171,9 @@ function App() {
                   className="p-4 hover:bg-github-itemHover flex items-start gap-4 transition-colors group"
                 >
                   <button 
-                    onClick={() => toggleTodo(todo.id)}
-                    className={`mt-1 transition-colors ${todo.completed ? 'text-github-closed' : 'text-github-open hover:text-github-accent'}`}
+                    onClick={() => toggleMutation.mutate(todo.id)}
+                    disabled={toggleMutation.isPending}
+                    className={`mt-1 transition-colors ${todo.completed ? 'text-github-closed' : 'text-github-open hover:text-github-accent'} ${toggleMutation.isPending ? 'opacity-50' : ''}`}
                   >
                     {todo.completed ? <CheckCircle2 size={18} /> : <Circle size={18} />}
                   </button>
@@ -194,8 +198,9 @@ function App() {
 
                   <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button 
-                      onClick={() => deleteTodo(todo.id)}
-                      className="p-2 hover:bg-red-500/10 hover:text-red-400 rounded-md transition-all text-github-textSecondary"
+                      onClick={() => deleteMutation.mutate(todo.id)}
+                      disabled={deleteMutation.isPending}
+                      className="p-2 hover:bg-red-500/10 hover:text-red-400 rounded-md transition-all text-github-textSecondary disabled:opacity-50"
                       title="Delete todo"
                     >
                       <Trash2 size={16} />

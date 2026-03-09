@@ -32,9 +32,14 @@ impl ClusterConfig {
 
         let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
 
-        let node_id = std::env::var("NODE_ID")
-            .ok()
-            .and_then(|s| Uuid::parse_str(&s).ok());
+        let node_id = std::env::var("NODE_ID").ok().and_then(|s| {
+            if let Ok(u) = Uuid::parse_str(&s) {
+                Some(u)
+            } else {
+                // Deterministic UUID from non-uuid string (e.g. pod name)
+                Some(Uuid::new_v5(&Uuid::NAMESPACE_DNS, s.as_bytes()))
+            }
+        });
 
         let dns_query = std::env::var("DNS_QUERY").ok();
 

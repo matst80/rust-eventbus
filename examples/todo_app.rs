@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -11,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rust_eventbus::{
@@ -76,13 +74,12 @@ pub struct TodoState {
 /// Used to maintain the API's in-memory Read Model.
 pub struct TodoProjection;
 
-#[async_trait]
 impl Projection<TodoEvent, TodoState> for TodoProjection {
     fn name(&self) -> &'static str {
         "todo_projection"
     }
 
-    async fn handle(
+    fn handle(
         &self,
         state: &mut TodoState,
         event: &Event<TodoEvent>,
@@ -126,13 +123,12 @@ pub struct EmailState {
     pub count: u32,
 }
 
-#[async_trait]
 impl Projection<TodoEvent, EmailState> for EmailNotificationProjection {
     fn name(&self) -> &'static str {
         "email_projection_durable"
     }
 
-    async fn handle(
+    fn handle(
         &self,
         state: &mut EmailState,
         event: &Event<TodoEvent>,
@@ -158,7 +154,7 @@ struct AppState {
     bus: EventBus<TodoEvent>,
     mesh: Arc<dyn DistributedPubSub<TodoEvent>>,
     event_store: Arc<FileEventStore>,
-    projection_state: Arc<RwLock<TodoState>>,
+    projection_state: Arc<parking_lot::RwLock<TodoState>>,
     projection_version: Arc<AtomicU64>,
 }
 
@@ -184,7 +180,7 @@ async fn get_todos(
         }
     }
 
-    let proj = state.projection_state.read().await;
+    let proj = state.projection_state.read();
     let mut todos: Vec<TodoItem> = Vec::with_capacity(proj.order.len());
     for id in proj.order.iter() {
         if let Some(item) = proj.todos.get(id) {
@@ -397,6 +393,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    // Wait for quorum before starting the server (optional but recommended for split-brain prevention)
+    tracing::info!("Waiting for cluster quorum...");
+    let mut quorum_retries = 0;
+    while let Err(e) = app_state.mesh.check_quorum().await {
+        quorum_retries += 1;
+        if quorum_retries % 5 == 0 {
+            tracing::warn!("Still waiting for quorum: {}", e);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if quorum_retries >= 30 {
+            tracing::warn!("Starting without quorum after 30s timeout");
+            break;
+        }
+    }
+    tracing::info!("Quorum check passed, starting API server...");
 
     let app = Router::new()
         .route("/todos", axum::routing::get(get_todos).post(create_todo))

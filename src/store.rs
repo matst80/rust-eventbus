@@ -270,6 +270,10 @@ where
                 .await
                 .map_err(|_| StoreError::Other("Background writer closed".into()))?;
 
+            // ⚡ Optimization: Release the lock before waiting for disk I/O.
+            // This allows other threads to prepare their batches while we wait for the sync.
+            drop(inner);
+
             // Await synchronization for durability
             let _ = sync_rx.await;
         }

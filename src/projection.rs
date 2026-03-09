@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use futures::StreamExt;
 use thiserror::Error;
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{watch};
+use parking_lot::{RwLock, Mutex};
 
 use crate::{
     bus::EventBus,
@@ -23,13 +23,12 @@ pub enum ProjectionError {
 }
 
 /// A definition of a stateful Projection that builds application state from the event stream.
-#[async_trait]
 pub trait Projection<E: EventPayload, S>: Send + Sync + 'static {
     /// Return the unique name of this projection (used for snapshot tracking).
     fn name(&self) -> &'static str;
 
     /// Process a single event and mutate the state `S`.
-    async fn handle(&self, state: &mut S, event: &Event<E>) -> Result<(), ProjectionError>;
+    fn handle(&self, state: &mut S, event: &Event<E>) -> Result<(), ProjectionError>;
 }
 
 /// Commands that can be sent to a running projection actor.
@@ -81,7 +80,7 @@ pub struct EphemeralProjectionActor<E: EventPayload, S, P, SS, ES> {
 impl<E, S, P, SS, ES> EphemeralProjectionActor<E, S, P, SS, ES>
 where
     E: EventPayload,
-    S: Default + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    S: Default + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     P: Projection<E, S>,
     SS: SnapshotStore<S>,
     ES: EventStore<E>,
@@ -98,7 +97,7 @@ where
             event_store,
             projection,
             snapshot_store,
-            state: Arc::new(RwLock::new(S::default())),
+            state: Arc::new(parking_lot::RwLock::new(S::default())),
             snapshot_interval: 100,
             cmd_tx,
             cmd_rx,
@@ -120,7 +119,7 @@ where
     }
 
     /// Returns a reference-counted lock to the underlying projection state.
-    pub fn get_state(&self) -> Arc<RwLock<S>> {
+    pub fn get_state(&self) -> Arc<parking_lot::RwLock<S>> {
         Arc::clone(&self.state)
     }
 
@@ -144,11 +143,11 @@ where
                         if let Err(_e) = self.snapshot_store.delete(self.projection.name()).await {
                             // Log error if needed, but don't block
                         }
-                        let mut state_lock = self.state.write().await;
+                        let mut state_lock = self.state.write();
                         *state_lock = S::default();
                     }
                     ProjectionCommand::Replay => {
-                        let mut state_lock = self.state.write().await;
+                        let mut state_lock = self.state.write();
                         *state_lock = S::default();
                     }
                     ProjectionCommand::Run => {}
@@ -164,7 +163,7 @@ where
                     if let Ok(Some((seq, loaded_state))) =
                         self.snapshot_store.load(self.projection.name()).await
                     {
-                        let mut state_lock = self.state.write().await;
+                        let mut state_lock = self.state.write();
                         *state_lock = loaded_state;
                         current_seq = seq;
                     }
@@ -177,32 +176,39 @@ where
                 // 3. Catch up from EventStore
                 let mut stream = self.event_store.read_all_from(current_seq + 1);
                 while let Some(Ok(event)) = stream.next().await {
-                    let mut state_lock = self.state.write().await;
-                    if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                        current_seq = current_seq.max(event.global_sequence_num);
-                        events_since_snapshot += 1;
-                        if let Some(v) = &self.version {
-                            v.fetch_add(1, Ordering::Relaxed);
-                        }
-                        if events_since_snapshot >= self.snapshot_interval {
-                            events_since_snapshot = 0;
-                            if let Err(_e) = self
-                                .snapshot_store
-                                .save(self.projection.name(), current_seq, &*state_lock)
-                                .await
-                            {
-                                // Log error if needed
+                    let mut needs_snapshot = false;
+                    let mut state_clone = None;
+                    {
+                        let mut state_lock = self.state.write();
+                        if let Ok(()) = self.projection.handle(&mut state_lock, &event) {
+                            current_seq = current_seq.max(event.global_sequence_num);
+                            events_since_snapshot += 1;
+                            if let Some(v) = &self.version {
+                                v.fetch_add(1, Ordering::Relaxed);
                             }
+                            if events_since_snapshot >= self.snapshot_interval {
+                                events_since_snapshot = 0;
+                                state_clone = Some(state_lock.clone());
+                                needs_snapshot = true;
+                            }
+                        }
+                    }
+                    if needs_snapshot {
+                        if let Err(_e) = self.snapshot_store
+                            .save(self.projection.name(), current_seq, &state_clone.unwrap())
+                            .await
+                        {
+                            // Log error if needed
                         }
                     }
                     tokio::task::yield_now().await;
                 }
                 // Save snapshot after catch-up if there were unsaved events.
                 if events_since_snapshot > 0 {
-                    let state_lock = self.state.read().await;
+                    let state_clone = self.state.read().clone();
                     let _ = self
                         .snapshot_store
-                        .save(self.projection.name(), current_seq, &*state_lock)
+                        .save(self.projection.name(), current_seq, &state_clone)
                         .await;
                     events_since_snapshot = 0;
                 }
@@ -226,26 +232,35 @@ where
                                     if event.global_sequence_num <= current_seq && event.global_sequence_num != 0 {
                                         continue;
                                     }
-                                    let mut state_lock = self.state.write().await;
-                                    match self.projection.handle(&mut state_lock, &event).await {
-                                        Ok(()) => {
-                                            current_seq = current_seq.max(event.global_sequence_num);
-                                            events_since_snapshot += 1;
-                                            if let Some(v) = &self.version {
-                                                v.fetch_add(1, Ordering::Relaxed);
-                                            }
-                                            if events_since_snapshot >= self.snapshot_interval {
-                                                events_since_snapshot = 0;
-                                                if let Err(e) = self.snapshot_store
-                                                    .save(self.projection.name(), current_seq, &*state_lock)
-                                                    .await
-                                                {
-                                                    eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
+                                    let mut needs_snapshot = false;
+                                    let mut state_clone = None;
+                                    {
+                                        let mut state_lock = self.state.write();
+                                        match self.projection.handle(&mut state_lock, &event) {
+                                            Ok(()) => {
+                                                current_seq = current_seq.max(event.global_sequence_num);
+                                                events_since_snapshot += 1;
+                                                if let Some(v) = &self.version {
+                                                    v.fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                if events_since_snapshot >= self.snapshot_interval {
+                                                    events_since_snapshot = 0;
+                                                    state_clone = Some(state_lock.clone());
+                                                    needs_snapshot = true;
                                                 }
                                             }
+                                            Err(e) => {
+                                                eprintln!("Projection {} failed to process event: {}", self.projection.name(), e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            eprintln!("Projection {} failed to process event: {}", self.projection.name(), e);
+                                    }
+
+                                    if needs_snapshot {
+                                        if let Err(e) = self.snapshot_store
+                                            .save(self.projection.name(), current_seq, &state_clone.unwrap())
+                                            .await
+                                        {
+                                            eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
                                         }
                                     }
                                 }
@@ -285,7 +300,7 @@ pub struct DurableProjectionActor<E: EventPayload, S, P, SS, ES, LM: ?Sized> {
 impl<E, S, P, SS, ES, LM> DurableProjectionActor<E, S, P, SS, ES, LM>
 where
     E: EventPayload,
-    S: Default + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
+    S: Default + Clone + Send + Sync + serde::Serialize + serde::de::DeserializeOwned + 'static,
     P: Projection<E, S>,
     SS: SnapshotStore<S>,
     ES: EventStore<E>,
@@ -307,7 +322,7 @@ where
             snapshot_store,
             lock_manager,
             node_id,
-            state: Arc::new(Mutex::new(S::default())),
+            state: Arc::new(parking_lot::Mutex::new(S::default())),
             snapshot_interval: 100,
             cmd_tx,
             cmd_rx,
@@ -326,7 +341,7 @@ where
         self
     }
 
-    pub fn get_state(&self) -> Arc<Mutex<S>> {
+    pub fn get_state(&self) -> Arc<parking_lot::Mutex<S>> {
         Arc::clone(&self.state)
     }
 
@@ -352,11 +367,11 @@ where
                     match cmd {
                         ProjectionCommand::Reset => {
                             let _ = self.snapshot_store.delete(self.projection.name()).await;
-                            let mut state_lock = self.state.lock().await;
+                            let mut state_lock = self.state.lock();
                             *state_lock = S::default();
                         }
                         ProjectionCommand::Replay => {
-                            let mut state_lock = self.state.lock().await;
+                            let mut state_lock = self.state.lock();
                             *state_lock = S::default();
                         }
                         ProjectionCommand::Run => {}
@@ -370,7 +385,7 @@ where
                         if let Ok(Some((seq, loaded_state))) =
                             self.snapshot_store.load(self.projection.name()).await
                         {
-                            let mut state_lock = self.state.lock().await;
+                            let mut state_lock = self.state.lock();
                             *state_lock = loaded_state;
                             current_seq = seq;
                         }
@@ -382,34 +397,42 @@ where
                     // Catch up from EventStore
                     let mut stream = self.event_store.read_all_from(current_seq + 1);
                     while let Some(Ok(event)) = stream.next().await {
-                        let mut state_lock = self.state.lock().await;
-                        if let Ok(()) = self.projection.handle(&mut state_lock, &event).await {
-                            current_seq = current_seq.max(event.global_sequence_num);
-                            events_since_snapshot += 1;
-                            if let Some(v) = &self.version {
-                                v.fetch_add(1, Ordering::Relaxed);
-                            }
-                            if events_since_snapshot >= self.snapshot_interval {
-                                events_since_snapshot = 0;
-                                if let Err(e) = self
-                                    .snapshot_store
-                                    .save(self.projection.name(), current_seq, &*state_lock)
-                                    .await
-                                {
-                                    eprintln!(
-                                        "Failed to save snapshot during catch-up for {}: {}",
-                                        self.projection.name(),
-                                        e
-                                    );
+                        let mut needs_snapshot = false;
+                        let mut state_clone = None;
+                        {
+                            let mut state_lock = self.state.lock();
+                            if let Ok(()) = self.projection.handle(&mut state_lock, &event) {
+                                current_seq = current_seq.max(event.global_sequence_num);
+                                events_since_snapshot += 1;
+                                if let Some(v) = &self.version {
+                                    v.fetch_add(1, Ordering::Relaxed);
                                 }
+                                if events_since_snapshot >= self.snapshot_interval {
+                                    events_since_snapshot = 0;
+                                    state_clone = Some(state_lock.clone());
+                                    needs_snapshot = true;
+                                }
+                            }
+                        }
+                        if needs_snapshot {
+                            if let Err(e) = self
+                                .snapshot_store
+                                .save(self.projection.name(), current_seq, &state_clone.unwrap())
+                                .await
+                            {
+                                eprintln!(
+                                    "Failed to save snapshot during catch-up for {}: {}",
+                                    self.projection.name(),
+                                    e
+                                );
                             }
                         }
                     }
                     if events_since_snapshot > 0 {
-                        let state_lock = self.state.lock().await;
+                        let state_clone = self.state.lock().clone();
                         if let Err(e) = self
                             .snapshot_store
-                            .save(self.projection.name(), current_seq, &*state_lock)
+                            .save(self.projection.name(), current_seq, &state_clone)
                             .await
                         {
                             eprintln!(
@@ -449,23 +472,31 @@ where
                                         if event.global_sequence_num <= current_seq && event.global_sequence_num != 0 {
                                             continue;
                                         }
-                                        let mut state_lock = self.state.lock().await;
-                                        match self.projection.handle(&mut state_lock, &event).await {
-                                            Ok(()) => {
-                                                current_seq = current_seq.max(event.global_sequence_num);
-                                                events_since_snapshot += 1;
-                                                if let Some(v) = &self.version {
-                                                    v.fetch_add(1, Ordering::Relaxed);
-                                                }
-                                                if events_since_snapshot >= self.snapshot_interval {
-                                                    events_since_snapshot = 0;
-                                                    if let Err(e) = self.snapshot_store.save(self.projection.name(), current_seq, &*state_lock).await {
-                                                        eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
+                                        let mut needs_snapshot = false;
+                                        let mut state_clone = None;
+                                        {
+                                            let mut state_lock = self.state.lock();
+                                            match self.projection.handle(&mut state_lock, &event) {
+                                                Ok(()) => {
+                                                    current_seq = current_seq.max(event.global_sequence_num);
+                                                    events_since_snapshot += 1;
+                                                    if let Some(v) = &self.version {
+                                                        v.fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    if events_since_snapshot >= self.snapshot_interval {
+                                                        events_since_snapshot = 0;
+                                                        state_clone = Some(state_lock.clone());
+                                                        needs_snapshot = true;
                                                     }
                                                 }
+                                                Err(e) => {
+                                                    eprintln!("Durable projection {} failed to process event: {}", self.projection.name(), e);
+                                                }
                                             }
-                                            Err(e) => {
-                                                eprintln!("Durable projection {} failed to process event: {}", self.projection.name(), e);
+                                        }
+                                        if needs_snapshot {
+                                            if let Err(e) = self.snapshot_store.save(self.projection.name(), current_seq, &state_clone.unwrap()).await {
+                                                eprintln!("Failed to save snapshot for {}: {}", self.projection.name(), e);
                                             }
                                         }
                                     }

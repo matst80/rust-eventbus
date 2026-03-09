@@ -24,6 +24,9 @@ pub trait PubSubBackend: Send + Sync + 'static {
     /// Implementations should return a 'static boxed stream of payloads.
     fn subscribe_bytes(&self, topic: &str)
         -> BoxStream<'static, Result<Vec<u8>, DistributedError>>;
+
+    /// Verify if quorum is met for the backend.
+    async fn check_quorum(&self) -> Result<(), DistributedError>;
 }
 
 /// Helper for encoding/decoding `Event<E>` to/from bytes for wire transport.
@@ -112,6 +115,10 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         });
         Box::pin(mapped)
     }
+
+    async fn check_quorum(&self) -> Result<(), DistributedError> {
+        self.backend.check_quorum().await
+    }
 }
 
 #[derive(Debug, Error)]
@@ -163,6 +170,10 @@ pub trait DistributedPubSub<E: EventPayload>: Send + Sync + 'static {
 
     /// Subscribes to events arriving from other nodes over the network.
     async fn subscribe(&self) -> BoxStream<'static, Result<Event<E>, DistributedError>>;
+
+    /// Verify that a majority of nodes in the cluster are reachable.
+    /// Returns Ok(()) if the node count satisfies (TotalNodes / 2) + 1.
+    async fn check_quorum(&self) -> Result<(), DistributedError>;
 }
 
 /// Trait to handle Projection Singleton/Sharding in a distributed environment.
@@ -315,18 +326,69 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> TcpP
         advertised_addr: String,
         discovery: Arc<dyn NodeDiscovery>,
     ) -> Self {
-        Self {
+        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let mesh = Self {
             node_id,
             listen_addr,
-            advertised_addr,
-            discovery,
+            advertised_addr: advertised_addr.clone(),
+            discovery: discovery.clone(),
             discovery_cache: Arc::new(parking_lot::Mutex::new((
                 std::time::Instant::now() - std::time::Duration::from_secs(60),
                 vec![],
             ))),
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            connections: connections.clone(),
             _phantom: std::marker::PhantomData,
-        }
+        };
+
+        // Proactive Connection Manager: Fixes quorum-on-startup chicken-and-egg problem.
+        // Periodically ensures we have connections to all discovered peers.
+        let discovery_cache = mesh.discovery_cache.clone();
+        let discovery_inner = discovery.clone();
+        let advertised_addr_inner = advertised_addr.clone();
+        tokio::spawn(async move {
+            loop {
+                // Refresh nodes
+                if let Ok(nodes) = discovery_inner.discover_nodes().await {
+                    {
+                        let mut cache = discovery_cache.lock();
+                        *cache = (std::time::Instant::now(), nodes.clone());
+                    }
+
+                    for node in nodes {
+                        if same_endpoint(&node.address, &advertised_addr_inner) {
+                            continue;
+                        }
+
+                        let addr = node.address.clone();
+                        let conns = connections.clone();
+
+                        // Only connect if we don't already have an active stream
+                        let has_conn = {
+                            let c = conns.lock().await;
+                            c.contains_key(&addr)
+                        };
+
+                        if !has_conn {
+                            tokio::spawn(async move {
+                                if let Ok(Ok(mut s)) = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    tokio::net::TcpStream::connect(&addr),
+                                )
+                                .await
+                                {
+                                    let _ = s.set_nodelay(true);
+                                    let mut c = conns.lock().await;
+                                    c.insert(addr, s);
+                                }
+                            });
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+
+        mesh
     }
 }
 
@@ -378,12 +440,9 @@ impl TcpPubSubBackend {
             connections: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-}
 
-#[async_trait]
-impl PubSubBackend for TcpPubSubBackend {
-    async fn publish_bytes(&self, _topic: &str, payload: Vec<u8>) -> Result<(), DistributedError> {
-        let nodes = {
+    async fn get_nodes(&self) -> Result<Vec<Node>, DistributedError> {
+        let cached = {
             let cache = self.discovery_cache.lock();
             if cache.0.elapsed() < std::time::Duration::from_secs(5) {
                 Some(cache.1.clone())
@@ -392,15 +451,24 @@ impl PubSubBackend for TcpPubSubBackend {
             }
         };
 
-        let nodes = if let Some(n) = nodes {
-            n
-        } else {
-            let n = self.discovery.discover_nodes().await?;
+        if let Some(n) = cached {
+            return Ok(n);
+        }
+
+        let n = self.discovery.discover_nodes().await?;
+        {
             let mut cache = self.discovery_cache.lock();
             *cache = (std::time::Instant::now(), n.clone());
-            n
-        };
+        }
+        Ok(n)
+    }
+}
 
+#[async_trait]
+impl PubSubBackend for TcpPubSubBackend {
+    async fn publish_bytes(&self, _topic: &str, payload: Vec<u8>) -> Result<(), DistributedError> {
+        self.check_quorum().await?;
+        let nodes = self.get_nodes().await?;
         let my_addr = self.advertised_addr.clone();
 
         let event_payload = payload;
@@ -462,6 +530,29 @@ impl PubSubBackend for TcpPubSubBackend {
         }
 
         Ok(())
+    }
+
+    async fn check_quorum(&self) -> Result<(), DistributedError> {
+        let nodes = self.get_nodes().await?;
+        // If we only see 1 node total, quorum is reached by definition (single node cluster)
+        if nodes.len() <= 1 {
+            return Ok(());
+        }
+
+        let min_required = (nodes.len() / 2) + 1;
+        
+        // Count active connections + self
+        let active_nodes = {
+            let conns = self.connections.lock().await;
+            conns.len() + 1
+        };
+
+        if active_nodes >= min_required {
+            Ok(())
+        } else {
+            tracing::warn!("Quorum check failed: have {} nodes, need {}", active_nodes, min_required);
+            Err(DistributedError::NoQuorum)
+        }
     }
 
     fn subscribe_bytes(
@@ -541,24 +632,8 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
     for TcpPubSub<E>
 {
     async fn publish(&self, event: &Event<E>) -> Result<(), DistributedError> {
-        let nodes = {
-            let cache = self.discovery_cache.lock();
-            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
-                Some(cache.1.clone())
-            } else {
-                None
-            }
-        };
-
-        let nodes = if let Some(n) = nodes {
-            n
-        } else {
-            let n = self.discovery.discover_nodes().await?;
-            let mut cache = self.discovery_cache.lock();
-            *cache = (std::time::Instant::now(), n.clone());
-            n
-        };
-
+        self.check_quorum().await?;
+        let nodes = self.get_nodes().await?;
         let my_addr = self.advertised_addr.clone();
         let active_peer_addrs: std::collections::HashSet<String> = nodes
             .iter()
@@ -640,6 +715,27 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
             tokio::task::yield_now().await;
         }
         Ok(())
+    }
+
+    async fn check_quorum(&self) -> Result<(), DistributedError> {
+        let nodes = self.get_nodes().await?;
+        if nodes.len() <= 1 {
+            return Ok(());
+        }
+
+        let min_required = (nodes.len() / 2) + 1;
+        
+        let active_nodes = {
+            let conns = self.connections.lock().await;
+            conns.len() + 1
+        };
+
+        if active_nodes >= min_required {
+            Ok(())
+        } else {
+            tracing::warn!("Quorum check failed: have {} nodes, need {}", active_nodes, min_required);
+            Err(DistributedError::NoQuorum)
+        }
     }
 
     async fn subscribe(&self) -> BoxStream<'static, Result<Event<E>, DistributedError>> {
@@ -744,6 +840,30 @@ impl<E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de>> Dist
         });
 
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+    }
+}
+
+impl<E: EventPayload> TcpPubSub<E> {
+    async fn get_nodes(&self) -> Result<Vec<Node>, DistributedError> {
+        let cached = {
+            let cache = self.discovery_cache.lock();
+            if cache.0.elapsed() < std::time::Duration::from_secs(5) {
+                Some(cache.1.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(n) = cached {
+            return Ok(n);
+        }
+
+        let n = self.discovery.discover_nodes().await?;
+        {
+            let mut cache = self.discovery_cache.lock();
+            *cache = (std::time::Instant::now(), n.clone());
+        }
+        Ok(n)
     }
 }
 

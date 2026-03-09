@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -27,7 +26,7 @@ impl EventPayload for AppEvent {
 }
 
 // 2. Define our Projection State
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct UserCountState {
     pub total_users: u64,
 }
@@ -35,13 +34,12 @@ pub struct UserCountState {
 // 3. Define our Projection Logic
 pub struct UserCountProjection;
 
-#[async_trait]
 impl Projection<AppEvent, UserCountState> for UserCountProjection {
     fn name(&self) -> &'static str {
         "user_count_projection"
     }
 
-    async fn handle(
+    fn handle(
         &self,
         state: &mut UserCountState,
         event: &Event<AppEvent>,

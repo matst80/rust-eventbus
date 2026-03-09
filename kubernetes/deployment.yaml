@@ -1,10 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: todo-app
   labels:
     app: todo-app
 spec:
+  serviceName: "todo-app-headless"
   replicas: 3
   selector:
     matchLabels:
@@ -50,7 +51,7 @@ spec:
         - name: NODE_ID
           valueFrom:
             fieldRef:
-              fieldPath: metadata.uid
+              fieldPath: metadata.name
         readinessProbe:
           tcpSocket:
             port: 3001
@@ -75,22 +76,15 @@ spec:
       terminationGracePeriodSeconds: 30
       nodeSelector:
         kubernetes.io/arch: arm64
-      volumes:
-      - name: data-storage
-        persistentVolumeClaim:
-          claimName: todo-app-pvc
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: todo-app-pvc
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: nfs-client
-  resources:
-    requests:
-      storage: 1Gi
+  volumeClaimTemplates:
+  - metadata:
+      name: data-storage
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      storageClassName: nfs-client
+      resources:
+        requests:
+          storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
