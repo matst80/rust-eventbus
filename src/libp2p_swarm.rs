@@ -1,13 +1,15 @@
 //! Real libp2p gossipsub+mdns swarm integration.
 #![cfg(feature = "libp2p-backend")]
 
-use std::error::Error;
 use futures::prelude::*;
+use std::error::Error;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
-use libp2p::{identity, PeerId, swarm::Swarm, swarm::SwarmEvent};
-use libp2p_gossipsub::{Gossipsub, GossipsubConfig, GossipsubEvent, MessageAuthenticity, IdentTopic as Topic};
+use libp2p::{identity, swarm::Swarm, swarm::SwarmEvent, PeerId};
+use libp2p_gossipsub::{
+    Gossipsub, GossipsubConfig, GossipsubEvent, IdentTopic as Topic, MessageAuthenticity,
+};
 use libp2p_mdns::{Mdns, MdnsEvent};
 
 #[derive(Debug)]
@@ -17,7 +19,9 @@ pub struct SwarmHandle {
 }
 
 /// Spawn a gossipsub+mdns swarm and return handles for publish/subscribe.
-pub async fn spawn_swarm(listen_addr: Option<String>) -> Result<SwarmHandle, Box<dyn Error + Send + Sync>> {
+pub async fn spawn_swarm(
+    listen_addr: Option<String>,
+) -> Result<SwarmHandle, Box<dyn Error + Send + Sync>> {
     let (inbound_tx, _inbound_rx) = broadcast::channel(512);
     let (publish_tx, mut publish_rx) = mpsc::channel::<Vec<u8>>(64);
 
@@ -34,7 +38,10 @@ pub async fn spawn_swarm(listen_addr: Option<String>) -> Result<SwarmHandle, Box
 
     // gossipsub
     let gossipsub_config = GossipsubConfig::default();
-    let mut gossipsub = Gossipsub::new(MessageAuthenticity::Signed(local_key.clone()), gossipsub_config)?;
+    let mut gossipsub = Gossipsub::new(
+        MessageAuthenticity::Signed(local_key.clone()),
+        gossipsub_config,
+    )?;
 
     // mdns
     let mdns = Mdns::new(Default::default()).await?;
@@ -52,8 +59,16 @@ pub async fn spawn_swarm(listen_addr: Option<String>) -> Result<SwarmHandle, Box
         Mdns(MdnsEvent),
     }
 
-    impl From<GossipsubEvent> for OutEvent { fn from(v: GossipsubEvent) -> Self { OutEvent::Gossipsub(v) } }
-    impl From<MdnsEvent> for OutEvent { fn from(v: MdnsEvent) -> Self { OutEvent::Mdns(v) } }
+    impl From<GossipsubEvent> for OutEvent {
+        fn from(v: GossipsubEvent) -> Self {
+            OutEvent::Gossipsub(v)
+        }
+    }
+    impl From<MdnsEvent> for OutEvent {
+        fn from(v: MdnsEvent) -> Self {
+            OutEvent::Mdns(v)
+        }
+    }
 
     let behaviour = Behaviour { gossipsub, mdns };
 
@@ -104,5 +119,8 @@ pub async fn spawn_swarm(listen_addr: Option<String>) -> Result<SwarmHandle, Box
         }
     });
 
-    Ok(SwarmHandle { publish_tx, inbound_tx })
+    Ok(SwarmHandle {
+        publish_tx,
+        inbound_tx,
+    })
 }

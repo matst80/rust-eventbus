@@ -22,18 +22,23 @@ pub trait PubSubBackend: Send + Sync + 'static {
 
     /// Subscribe to a topic/subject and receive raw payloads as a stream.
     /// Implementations should return a 'static boxed stream of payloads.
-    fn subscribe_bytes(&self, topic: &str) -> BoxStream<'static, Result<Vec<u8>, DistributedError>>;
+    fn subscribe_bytes(&self, topic: &str)
+        -> BoxStream<'static, Result<Vec<u8>, DistributedError>>;
 }
 
 /// Helper for encoding/decoding `Event<E>` to/from bytes for wire transport.
 pub struct EventCodec;
 
 impl EventCodec {
-    pub fn encode<E: serde::Serialize + for<'de> serde::Deserialize<'de>>(event: &Event<E>) -> Result<Vec<u8>, DistributedError> {
+    pub fn encode<E: serde::Serialize + for<'de> serde::Deserialize<'de>>(
+        event: &Event<E>,
+    ) -> Result<Vec<u8>, DistributedError> {
         bincode::serialize(event).map_err(|e| DistributedError::Network(e.to_string()))
     }
 
-    pub fn decode<E: for<'de> serde::Deserialize<'de> + serde::Serialize>(bytes: &[u8]) -> Result<Event<E>, DistributedError> {
+    pub fn decode<E: for<'de> serde::Deserialize<'de> + serde::Serialize>(
+        bytes: &[u8],
+    ) -> Result<Event<E>, DistributedError> {
         bincode::deserialize(bytes).map_err(|e| DistributedError::Network(e.to_string()))
     }
 }
@@ -436,7 +441,12 @@ impl PubSubBackend for TcpPubSubBackend {
                 }
 
                 if !send_success {
-                    match tokio::time::timeout(std::time::Duration::from_secs(2), tokio::net::TcpStream::connect(&addr)).await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(&addr),
+                    )
+                    .await
+                    {
                         Ok(Ok(mut s)) => {
                             let _ = s.set_nodelay(true);
                             if s.write_all(&payload).await.is_ok() {
@@ -454,7 +464,10 @@ impl PubSubBackend for TcpPubSubBackend {
         Ok(())
     }
 
-    fn subscribe_bytes(&self, _topic: &str) -> BoxStream<'static, Result<Vec<u8>, DistributedError>> {
+    fn subscribe_bytes(
+        &self,
+        _topic: &str,
+    ) -> BoxStream<'static, Result<Vec<u8>, DistributedError>> {
         let addr = self.listen_addr.clone();
         let my_node_id = self.node_id;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
