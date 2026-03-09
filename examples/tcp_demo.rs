@@ -3,18 +3,25 @@
 
 #[tokio::main]
 async fn main() {
-    use std::sync::Arc;
-    use uuid::Uuid;
     use futures::StreamExt;
+    use rust_eventbus::distributed::{
+        BackendPubSub, DistributedPubSub, EnvironmentNodeDiscovery, TcpPubSubBackend,
+    };
+    use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
-    use rust_eventbus::distributed::{TcpPubSubBackend, BackendPubSub, EnvironmentNodeDiscovery, DistributedPubSub};
+    use uuid::Uuid;
 
     // node identity and listen addr
     let node_id = Uuid::new_v4();
     let listen = "127.0.0.1:4006".to_string();
     let discovery = Arc::new(EnvironmentNodeDiscovery::new());
 
-    let backend = TcpPubSubBackend::new_with_advertised_addr(node_id, listen.clone(), listen.clone(), discovery);
+    let backend = TcpPubSubBackend::new_with_advertised_addr(
+        node_id,
+        listen.clone(),
+        listen.clone(),
+        discovery,
+    );
     let backend_arc: Arc<dyn rust_eventbus::distributed::PubSubBackend> = Arc::new(backend);
     let backend_pub = BackendPubSub::new(backend_arc, "ignored-topic".to_string());
 
@@ -43,9 +50,13 @@ async fn main() {
 
     // Simulate a remote peer by connecting and sending a framed message containing a bincode-serialized Event<DemoPayload>
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let mut stream = tokio::net::TcpStream::connect(&listen).await.expect("connect");
+    let mut stream = tokio::net::TcpStream::connect(&listen)
+        .await
+        .expect("connect");
     let fake_sender = Uuid::new_v4();
-    let payload = DemoPayload { msg: "hello-from-remote".into() };
+    let payload = DemoPayload {
+        msg: "hello-from-remote".into(),
+    };
     let event = rust_eventbus::event::Event::new("demo-agg", 1, payload);
     let serialized = bincode::serialize(&event).expect("bincode");
     let total_len = (16 + serialized.len()) as u32;

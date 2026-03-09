@@ -23,7 +23,11 @@ mod libp2p_adapter {
         pub async fn new(topic: &str) -> Result<Arc<Self>, Box<dyn Error + Send + Sync>> {
             // spawn the real swarm (no explicit listen addr)
             let handle = libp2p_swarm::spawn_swarm(None).await?;
-            Ok(Arc::new(Self { topic: topic.to_string(), publish_tx: handle.publish_tx, inbound_tx: handle.inbound_tx }))
+            Ok(Arc::new(Self {
+                topic: topic.to_string(),
+                publish_tx: handle.publish_tx,
+                inbound_tx: handle.inbound_tx,
+            }))
         }
 
         pub async fn new_with_addrs(
@@ -33,26 +37,36 @@ mod libp2p_adapter {
             _discovery: std::sync::Arc<dyn crate::distributed::NodeDiscovery>,
         ) -> Result<Arc<Self>, Box<dyn Error + Send + Sync>> {
             let handle = libp2p_swarm::spawn_swarm(Some(listen_addr)).await?;
-            Ok(Arc::new(Self { topic: "eventbus".to_string(), publish_tx: handle.publish_tx, inbound_tx: handle.inbound_tx }))
+            Ok(Arc::new(Self {
+                topic: "eventbus".to_string(),
+                publish_tx: handle.publish_tx,
+                inbound_tx: handle.inbound_tx,
+            }))
         }
     }
 
     #[async_trait::async_trait]
     impl PubSubBackend for Libp2pAdapter {
-        async fn publish_bytes(&self, _topic: &str, payload: Vec<u8>) -> Result<(), DistributedError> {
+        async fn publish_bytes(
+            &self,
+            _topic: &str,
+            payload: Vec<u8>,
+        ) -> Result<(), DistributedError> {
             self.publish_tx
                 .send(payload)
                 .await
                 .map_err(|e| DistributedError::Network(format!("publish channel closed: {}", e)))
         }
 
-        fn subscribe_bytes(&self, _topic: &str) -> BoxStream<'static, Result<Vec<u8>, DistributedError>> {
+        fn subscribe_bytes(
+            &self,
+            _topic: &str,
+        ) -> BoxStream<'static, Result<Vec<u8>, DistributedError>> {
             let rx = self.inbound_tx.subscribe();
-            let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
-                .map(|res| match res {
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(DistributedError::Network(e.to_string())),
-                });
+            let stream = tokio_stream::wrappers::BroadcastStream::new(rx).map(|res| match res {
+                Ok(v) => Ok(v),
+                Err(e) => Err(DistributedError::Network(e.to_string())),
+            });
             Box::pin(stream)
         }
     }
