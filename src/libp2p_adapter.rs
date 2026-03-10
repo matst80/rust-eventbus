@@ -69,6 +69,11 @@ mod libp2p_adapter {
             });
             Box::pin(stream)
         }
+
+        async fn check_quorum(&self) -> Result<(), DistributedError> {
+            // libp2p backend doesn't yet implement a quorum check
+            Ok(())
+        }
     }
 }
 

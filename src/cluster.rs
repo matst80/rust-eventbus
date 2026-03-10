@@ -1,6 +1,6 @@
 use crate::distributed::{
     DistributedPubSub, DnsNodeDiscovery, EnvironmentNodeDiscovery, NodeDiscovery,
-    ProjectionLockManager,
+    ProjectionLockManager, PubSubBackend, QuorumLockManager, TcpPubSub,
 };
 use crate::event::EventPayload;
 use crate::store::{FileEventStore, FileSnapshotStore};
@@ -229,14 +229,63 @@ pub async fn init_cluster<E: EventPayload + serde::Serialize + for<'de> serde::D
         mesh_advertised_addr.clone(),
         peer_discovery.clone(),
         Some(task_limiter.clone()),
+        Some(event_store.clone()),
     )
     .await;
 
-    let lock_dir = format!("{}/locks", data_dir);
-    let lock_manager = Arc::new(FileLeaseLockManager::new(
-        lock_dir,
-        std::time::Duration::from_secs(15),
-    ));
+    // Select lock manager implementation based on env var.
+    // If USE_QUORUM_LOCK=true we create a small quorum-based manager that
+    // negotiates ownership over the mesh. Otherwise fall back to the
+    // legacy FileLeaseLockManager used by examples.
+    let use_quorum = std::env::var("USE_QUORUM_LOCK")
+        .ok()
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
+    let lock_manager: Arc<dyn ProjectionLockManager> = if use_quorum {
+        // Create a bytes-oriented backend (TcpPubSubBackend) for lock negotiation and start its background manager.
+        let backend_concrete = Arc::new(TcpPubSub::new_with_advertised_addr(
+            node_id,
+            mesh_bind_addr.clone(),
+            mesh_advertised_addr.clone(),
+            peer_discovery.clone(),
+        ));
+
+        // Start the backend's background manager so it begins discovery/connect loops.
+        {
+            let bc = backend_concrete.clone();
+            tokio::spawn(async move {
+                bc.start_background_manager().await;
+            });
+        }
+
+        // Coerce concrete backend to trait object for the QuorumLockManager API.
+        let backend_trait: Arc<dyn PubSubBackend> = backend_concrete.clone();
+
+        // Create quorum manager and start its listener to process lock-topic messages.
+        let quorum_manager_concrete = Arc::new(QuorumLockManager::new(
+            node_id,
+            backend_trait,
+            peer_discovery.clone(),
+            std::time::Duration::from_secs(15),
+        ));
+
+        {
+            let qm = quorum_manager_concrete.clone();
+            tokio::spawn(async move {
+                let _ = qm.start_listener().await;
+            });
+        }
+
+        // Use quorum manager as the ProjectionLockManager trait object.
+        quorum_manager_concrete as Arc<dyn ProjectionLockManager>
+    } else {
+        let lock_dir = format!("{}/locks", data_dir);
+        Arc::new(FileLeaseLockManager::new(
+            lock_dir,
+            std::time::Duration::from_secs(15),
+        ))
+    };
 
     let projection_version = Arc::new(AtomicU64::new(0));
 

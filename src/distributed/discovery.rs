@@ -1,7 +1,7 @@
+use super::types::{DistributedError, Node};
 use async_trait::async_trait;
-use uuid::Uuid;
 use std::sync::Arc;
-use super::types::{Node, DistributedError};
+use uuid::Uuid;
 
 #[async_trait]
 pub trait DiscoveryHandler: Send + Sync + 'static {
@@ -16,10 +16,10 @@ pub trait DiscoveryHandler: Send + Sync + 'static {
 pub trait NodeDiscovery: Send + Sync + 'static {
     /// Returns a list of known nodes.
     async fn discover_nodes(&self) -> Result<Vec<Node>, DistributedError>;
-    
+
     /// Register the current node with the discovery service.
     async fn register(&self, node: Node) -> Result<(), DistributedError>;
-    
+
     /// Unregister the current node.
     async fn unregister(&self, node: &Node) -> Result<(), DistributedError>;
 
@@ -75,10 +75,12 @@ impl NodeDiscovery for EnvironmentNodeDiscovery {
 
     async fn watch(&self, handler: Arc<dyn DiscoveryHandler>) -> Result<(), DistributedError> {
         for addr in &self.peers {
-            handler.on_node_added(Node {
-                id: Uuid::nil(),
-                address: addr.clone(),
-            }).await;
+            handler
+                .on_node_added(Node {
+                    id: Uuid::nil(),
+                    address: addr.clone(),
+                })
+                .await;
         }
         Ok(())
     }
@@ -117,11 +119,11 @@ impl NodeDiscovery for DnsNodeDiscovery {
                     }
                 }
 
-                if nodes.is_empty() {
-                    tracing::warn!("DNS discovery for {} returned no addresses", query);
-                } else {
-                    tracing::info!("DNS discovery for {}: found {} nodes", query, nodes.len());
-                }
+                // if nodes.is_empty() {
+                //     tracing::warn!("DNS discovery for {} returned no addresses", query);
+                // } else {
+                //     tracing::info!("DNS discovery for {}: found {} nodes", query, nodes.len());
+                // }
                 Ok(nodes)
             }
             Err(e) => {
@@ -142,30 +144,35 @@ impl NodeDiscovery for DnsNodeDiscovery {
 
     async fn watch(&self, handler: Arc<dyn DiscoveryHandler>) -> Result<(), DistributedError> {
         let mut last_nodes = std::collections::HashSet::<String>::new();
-        
+
         loop {
             if let Ok(nodes) = self.discover_nodes().await {
-                let current_nodes: std::collections::HashSet<String> = nodes.into_iter().map(|n| n.address).collect();
-                
+                let current_nodes: std::collections::HashSet<String> =
+                    nodes.into_iter().map(|n| n.address).collect();
+
                 // Added
                 for addr in current_nodes.difference(&last_nodes) {
-                    handler.on_node_added(Node {
-                        id: Uuid::nil(),
-                        address: addr.clone(),
-                    }).await;
+                    handler
+                        .on_node_added(Node {
+                            id: Uuid::nil(),
+                            address: addr.clone(),
+                        })
+                        .await;
                 }
-                
+
                 // Removed
                 for addr in last_nodes.difference(&current_nodes) {
-                    handler.on_node_removed(Node {
-                        id: Uuid::nil(),
-                        address: addr.clone(),
-                    }).await;
+                    handler
+                        .on_node_removed(Node {
+                            id: Uuid::nil(),
+                            address: addr.clone(),
+                        })
+                        .await;
                 }
-                
+
                 last_nodes = current_nodes;
             }
-            
+
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     }

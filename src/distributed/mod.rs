@@ -1,63 +1,79 @@
 use uuid::Uuid;
 
-pub mod types;
 pub mod discovery;
-pub mod pubsub;
-pub mod tcp;
 pub mod locks;
+pub mod pubsub;
+pub mod quorum_lock;
 pub mod store;
+pub mod tcp;
+pub mod types;
 
-pub use types::*;
 pub use discovery::*;
-pub use pubsub::*;
-pub use tcp::*;
 pub use locks::*;
+pub use pubsub::*;
+pub use quorum_lock::*;
 pub use store::*;
+pub use tcp::*;
+pub use types::*;
 
 use crate::event::EventPayload;
 
 /// Factory that returns the default mesh implementation as a trait object.
-/// By default this returns the `TcpPubSub` implementation. Enabling the
-/// `libp2p-backend` feature will switch to the libp2p adapter if available.
+/// Creates a `TcpPubSub` (bytes-oriented) wrapped in `BackendPubSub` (typed).
 pub async fn default_mesh<E>(
     node_id: Uuid,
     listen_addr: String,
     advertised_addr: String,
     discovery: std::sync::Arc<dyn NodeDiscovery>,
     task_limiter: Option<crate::task_limiter::TaskLimiter>,
+    event_store: Option<std::sync::Arc<dyn crate::store::EventStore<E>>>,
 ) -> std::sync::Arc<dyn DistributedPubSub<E>>
 where
     E: EventPayload + serde::Serialize + for<'de> serde::Deserialize<'de> + 'static,
 {
-    #[cfg(feature = "libp2p-backend")]
-    {
-        // When the feature is enabled we prefer the libp2p adapter. The adapter
-        // is expected to implement `DistributedPubSub<E>` and currently provides
-        // an async constructor.
-        if let Ok(adapter) = crate::libp2p_adapter::Libp2pAdapter::new_with_addrs(
-            node_id,
-            listen_addr.clone(),
-            advertised_addr.clone(),
-            discovery.clone(),
-        )
-        .await
-        {
-            let backend_arc: std::sync::Arc<dyn PubSubBackend> = adapter;
-            return std::sync::Arc::new(BackendPubSub::new(backend_arc, "eventbus".to_string()));
-        }
+    let mut tcp =
+        TcpPubSub::new_with_advertised_addr(node_id, listen_addr, advertised_addr, discovery);
+    if let Some(l) = task_limiter {
+        tcp = tcp.with_task_limiter(l);
+    }
+    let tcp = std::sync::Arc::new(tcp);
+    tcp.clone().start_background_manager().await;
+
+    let backend: std::sync::Arc<dyn PubSubBackend> = tcp.clone();
+    let mesh = std::sync::Arc::new(BackendPubSub::new(backend, "eventbus".to_string()));
+
+    // Background Sync/Anti-Entropy Manager
+    if let Some(store) = event_store {
+        let mesh_clone = mesh.clone();
+        let tcp_clone = tcp.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut raw_incoming = tcp_clone.subscribe_bytes("eventbus");
+            while let Some(res) = raw_incoming.next().await {
+                if let Ok(bytes) = res {
+                    if let Ok(envelope) = EventCodec::decode::<E>(&bytes) {
+                        match envelope {
+                            MeshEnvelope::SyncRequest { from_seq } => {
+                                tracing::debug!("Received SyncRequest from seq {}", from_seq);
+                                let mut events_stream = store.read_all_from(from_seq + 1);
+                                while let Some(Ok(event)) = events_stream.next().await {
+                                    let _ = mesh_clone.publish(&event).await;
+                                }
+                            }
+                            MeshEnvelope::Event(_) => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Request a sync on startup to catch up with existing nodes
+        let mesh_clone = mesh.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let _ = DistributedPubSub::<E>::request_sync(mesh_clone.as_ref(), 0).await;
+        });
     }
 
-    // Default: TcpPubSub
-    let mut mesh = TcpPubSub::new_with_advertised_addr(
-        node_id,
-        listen_addr,
-        advertised_addr,
-        discovery,
-    );
-    if let Some(l) = task_limiter {
-        mesh = mesh.with_task_limiter(l);
-    }
-    let mesh = std::sync::Arc::new(mesh);
-    mesh.clone().start_background_manager().await;
     mesh
 }

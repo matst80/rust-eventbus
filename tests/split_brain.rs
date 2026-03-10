@@ -1,6 +1,6 @@
 use rust_eventbus::event::{Event, EventPayload};
 use rust_eventbus::store::{FileEventStore, EventStore};
-use rust_eventbus::distributed::{TcpPubSub, NodeDiscovery, Node, DistributedError, DistributedPubSub, DiscoveryHandler};
+use rust_eventbus::distributed::{NodeDiscovery, Node, DistributedError, DistributedPubSub, DiscoveryHandler};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -92,22 +92,26 @@ async fn test_severe_split_brain_divergence() {
     });
 
     // Node 1 setup
-    let mesh1: Arc<TcpPubSub<TestEvent>> = Arc::new(TcpPubSub::new_with_advertised_addr(
+    let store1 = Arc::new(FileEventStore::new(node1_dir.join("events.bin")).await.unwrap());
+    let mesh1 = rust_eventbus::distributed::default_mesh(
         node1_id,
         "127.0.0.1:15001".to_string(),
         "127.0.0.1:15001".to_string(),
         discovery1.clone(),
-    ));
-    let store1 = Arc::new(FileEventStore::new(node1_dir.join("events.bin")).await.unwrap());
+        None,
+        Some(store1.clone() as Arc<dyn EventStore<TestEvent>>),
+    ).await;
 
     // Node 2 setup
-    let mesh2: Arc<TcpPubSub<TestEvent>> = Arc::new(TcpPubSub::new_with_advertised_addr(
+    let store2 = Arc::new(FileEventStore::new(node2_dir.join("events.bin")).await.unwrap());
+    let mesh2 = rust_eventbus::distributed::default_mesh(
         node2_id,
         "127.0.0.1:15002".to_string(),
         "127.0.0.1:15002".to_string(),
         discovery2.clone(),
-    ));
-    let store2 = Arc::new(FileEventStore::new(node2_dir.join("events.bin")).await.unwrap());
+        None,
+        Some(store2.clone() as Arc<dyn EventStore<TestEvent>>),
+    ).await;
 
     // Register nodes
     discovery1.register(Node { id: node1_id, address: "127.0.0.1:15001".to_string() }).await.unwrap();
@@ -117,7 +121,7 @@ async fn test_severe_split_brain_divergence() {
 
     // Start mesh listeners (simplified version of the loop in todo_app.rs)
     let store1_c = store1.clone();
-    let mut sub1 = mesh1.subscribe().await;
+    let mut sub1 = DistributedPubSub::<TestEvent>::subscribe(mesh1.as_ref()).await;
     tokio::spawn(async move {
         while let Some(Ok(ev)) = sub1.next().await {
             let _ = store1_c.append(vec![ev]).await;
@@ -125,7 +129,7 @@ async fn test_severe_split_brain_divergence() {
     });
 
     let store2_c = store2.clone();
-    let mut sub2 = mesh2.subscribe().await;
+    let mut sub2 = DistributedPubSub::<TestEvent>::subscribe(mesh2.as_ref()).await;
     tokio::spawn(async move {
         while let Some(Ok(ev)) = sub2.next().await {
             let _ = store2_c.append(vec![ev]).await;
@@ -133,16 +137,15 @@ async fn test_severe_split_brain_divergence() {
     });
 
     // Start mesh managers
-    mesh1.clone().start_background_manager().await;
-    mesh2.clone().start_background_manager().await;
+    // default_mesh already starts background managers for us
 
     // Allow time for background connection tasks to establish connections
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // --- PHASE 1: Healthy Cluster ---
     let ev1 = Event::new("shared", 1, TestEvent { data: "initial".into() });
     let stored = store1.append(vec![ev1.clone()]).await.unwrap();
-    mesh1.publish(&stored[0]).await.unwrap();
+    DistributedPubSub::<TestEvent>::publish(mesh1.as_ref(), &stored[0]).await.unwrap();
 
     // Allow time for propagation
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -162,12 +165,12 @@ async fn test_severe_split_brain_divergence() {
     let stored1 = store1.append(vec![ev2_node1]).await.unwrap();
     // Allow time for discovery cache to expire (5s) and connections to be dropped
     tokio::time::sleep(Duration::from_secs(6)).await;
-    mesh1.publish(&stored1[0]).await.unwrap();
+    DistributedPubSub::<TestEvent>::publish(mesh1.as_ref(), &stored1[0]).await.unwrap();
 
     // Node 2 writes while partitioned
     let ev2_node2 = Event::new("shared", 2, TestEvent { data: "node2_only".into() });
     let stored2 = store2.append(vec![ev2_node2]).await.unwrap();
-    mesh2.publish(&stored2[0]).await.unwrap();
+    DistributedPubSub::<TestEvent>::publish(mesh2.as_ref(), &stored2[0]).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -191,35 +194,44 @@ async fn test_severe_split_brain_divergence() {
         s1_events[1].as_ref().unwrap().payload.data, 
         s2_events[1].as_ref().unwrap().payload.data);
 
+    println!("Test: Node 1 ID = {}, Node 2 ID = {}", node1_id, node2_id);
+
     // --- PHASE 3: Heal Partition (The "Severe" part) ---
     discovery1.partitioned.store(false, std::sync::atomic::Ordering::Relaxed);
     discovery2.partitioned.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    // Allow time for reconnection
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Allow time for reconnection (reconciler runs every 5s)
+    tokio::time::sleep(Duration::from_secs(6)).await;
 
     // Node 1 writes a new event after healing
     let ev3_node1 = Event::new("shared", 3, TestEvent { data: "after_heal".into() });
     let stored3 = store1.append(vec![ev3_node1]).await.unwrap();
-    mesh1.publish(&stored3[0]).await.unwrap();
+    DistributedPubSub::<TestEvent>::publish(mesh1.as_ref(), &stored3[0]).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Trigger sync on both nodes to catch up on missed events during partition
+    DistributedPubSub::<TestEvent>::request_sync(mesh1.as_ref(), 0).await.unwrap();
+    DistributedPubSub::<TestEvent>::request_sync(mesh2.as_ref(), 0).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
 
     // Now look at Node 2's store
     let s2_final: Vec<Result<Event<TestEvent>, _>> = EventStore::<TestEvent>::read_all_from(store2.as_ref(), 0).collect().await;
-    // Node 2 will have:
+    // Node 2 should have:
     // 1. Initial (seq 1)
-    // 2. node2_only (seq 2) - its OWN version
-    // 3. after_heal (seq 3) - received from Node 1
-    // It TOTALLY MISSED node1_only (seq 2)!
+    // 2. node2_only (seq 2)
+    // 3. after_heal (seq 3)
+    // 4. node1_only (recovered via sync from Node 1)
     
-    println!("Node 2 events:");
+    println!("Node 2 final events:");
     for (i, ev) in s2_final.iter().enumerate() {
         println!("  {}: seq={}, data={}", i, ev.as_ref().unwrap().global_sequence_num, ev.as_ref().unwrap().payload.data);
     }
 
-    assert_eq!(s2_final.len(), 3);
-    // The "after_heal" event successfully propagated, but the gap at sequence 2 remains diverged.
+    assert_eq!(s2_final.len(), 4, "Node 2 should have recovered the missed event via SyncRequest");
+    // Both nodes now have all events (diverged versions included)
+    
+    let s1_final: Vec<Result<Event<TestEvent>, _>> = EventStore::<TestEvent>::read_all_from(store1.as_ref(), 0).collect().await;
+    assert_eq!(s1_final.len(), 4, "Node 1 should also have all 4 events eventually");
     
     // Clean up
     tokio::fs::remove_dir_all(&temp_dir).await.unwrap();

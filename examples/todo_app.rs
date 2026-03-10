@@ -44,6 +44,7 @@ pub enum TodoEvent {
     TodoCreated { title: String },
     TodoCompleted,
     TodoDeleted,
+    ClearAll,
 }
 
 impl EventPayload for TodoEvent {
@@ -52,6 +53,7 @@ impl EventPayload for TodoEvent {
             TodoEvent::TodoCreated { .. } => "TodoCreated",
             TodoEvent::TodoCompleted => "TodoCompleted",
             TodoEvent::TodoDeleted => "TodoDeleted",
+            TodoEvent::ClearAll => "ClearAll",
         }
     }
 }
@@ -114,6 +116,9 @@ impl Projection<TodoEvent, TodoState> for TodoProjection {
                 state.todos.remove(&aggregate_id);
                 state.order.retain(|id| id != &aggregate_id);
             }
+            TodoEvent::ClearAll => {
+                // Ignore here, reset() command handles state clearing
+            }
         }
         Ok(())
     }
@@ -161,6 +166,8 @@ struct AppState {
     projection_state: Arc<parking_lot::RwLock<TodoState>>,
     projection_version: Arc<AtomicU64>,
     task_limiter: rust_eventbus::task_limiter::TaskLimiter,
+    ephemeral_handle: rust_eventbus::projection::ProjectionHandle,
+    durable_handle: rust_eventbus::projection::ProjectionHandle,
 }
 
 // 6. Define API Handlers
@@ -324,6 +331,26 @@ async fn delete_todo(
     Ok(StatusCode::OK)
 }
 
+async fn clear_all(
+    State(state): State<AppState>,
+) -> Result<StatusCode, StatusCode> {
+    println!("Node {} handling clear_all", state.node_id);
+    
+    let event: Event<TodoEvent> = Event::new("system", 0, TodoEvent::ClearAll);
+    
+    if let Err(err) = state.mesh.publish(&event).await {
+        eprintln!("Failed to broadcast ClearAll: {:?}", err);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    
+    // Also trigger locally
+    let _ = <dyn EventStore<TodoEvent>>::truncate_before(state.event_store.as_ref(), u64::MAX).await;
+    state.ephemeral_handle.reset();
+    state.durable_handle.reset();
+
+    Ok(StatusCode::OK)
+}
+
 // 7. Wiring
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = rust_eventbus::cluster::ClusterConfig::from_env();
@@ -380,6 +407,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_version(projection_version.clone())
         .with_task_limiter(cluster.task_limiter.clone());
+        
+        let ephemeral_handle = ephemeral_actor.get_handle();
         let projection_state = ephemeral_actor.get_state();
         ephemeral_actor.spawn().await;
 
@@ -392,6 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_id,
         )
         .with_task_limiter(cluster.task_limiter.clone());
+        let durable_handle = durable_actor.get_handle();
         durable_actor.spawn().await;
 
         let self_mesh_addr = mesh_advertised_addr.clone();
@@ -421,17 +451,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             projection_state,
             projection_version,
             task_limiter: cluster.task_limiter.clone(),
+            ephemeral_handle: ephemeral_handle.clone(),
+            durable_handle: durable_handle.clone(),
         };
 
         let mesh_for_subscribe = app_state.mesh.clone();
         let bus_for_mesh = app_state.bus.clone();
         let event_store_for_mesh = app_state.event_store.clone();
         let limiter_mesh = cluster.task_limiter.clone();
+        let e_handle = ephemeral_handle.clone();
+        let d_handle = durable_handle.clone();
+        
         limiter_mesh.spawn(async move {
             let mut incoming = mesh_for_subscribe.subscribe().await;
             while let Some(result) = incoming.next().await {
                 match result {
                     Ok(event) => {
+                        if let TodoEvent::ClearAll = &event.payload {
+                            tracing::info!("Received ClearAll from mesh, resetting...");
+                            let _ = <dyn EventStore<TodoEvent>>::truncate_before(event_store_for_mesh.as_ref(), u64::MAX).await;
+                            e_handle.reset();
+                            d_handle.reset();
+                            continue;
+                        }
                         // Persist the remote event into the local EventStore so the local
                         // projections can rely on a monotonic, local `global_sequence_num`.
                         // Do NOT re-publish to the mesh here to avoid loops.
@@ -467,6 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let app = Router::new()
             .route("/todos", axum::routing::get(get_todos).post(create_todo))
+            .route("/todos/clear", delete(clear_all))
             .route("/todos/{id}/complete", put(complete_todo))
             .route("/todos/{id}", delete(delete_todo))
             .with_state(app_state);

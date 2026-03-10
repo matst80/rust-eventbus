@@ -1,11 +1,11 @@
-// Simple demo showing `TcpPubSubBackend` subscribe path and a simulated remote sender.
+// Simple demo showing `TcpPubSub` subscribe path and a simulated remote sender.
 // Run: `cargo run --example tcp_demo`
 
 #[tokio::main]
 async fn main() {
     use futures::StreamExt;
     use rust_eventbus::distributed::{
-        BackendPubSub, DistributedPubSub, EnvironmentNodeDiscovery, TcpPubSubBackend,
+        BackendPubSub, DistributedPubSub, EnvironmentNodeDiscovery, TcpPubSub,
     };
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
@@ -16,7 +16,7 @@ async fn main() {
     let listen = "127.0.0.1:4006".to_string();
     let discovery = Arc::new(EnvironmentNodeDiscovery::new());
 
-    let backend = TcpPubSubBackend::new_with_advertised_addr(
+    let backend = TcpPubSub::new_with_advertised_addr(
         node_id,
         listen.clone(),
         listen.clone(),

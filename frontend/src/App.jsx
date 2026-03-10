@@ -68,6 +68,18 @@ function App() {
     },
   });
 
+  const clearAllMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch('/api/todos/clear', {
+        method: 'DELETE',
+      });
+      if (!response.ok) throw new Error('Failed to clear todos');
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['todos'] });
+    },
+  });
+
   const handleAddTodo = (e) => {
     e.preventDefault();
     if (!newTodo.trim()) return;
@@ -87,7 +99,18 @@ function App() {
           </div>
           <h1 className="text-xl font-semibold">EventBus Todos</h1>
         </div>
-        <div className="flex items-center gap-4 text-github-textSecondary text-sm">
+        <div className="flex items-center gap-6 text-github-textSecondary text-sm">
+          <button 
+            onClick={() => {
+              if (window.confirm('Delete all todos and start over?')) {
+                clearAllMutation.mutate();
+              }
+            }}
+            disabled={clearAllMutation.isPending}
+            className="text-red-400 hover:text-red-300 font-medium flex items-center gap-1 transition-colors disabled:opacity-50"
+          >
+            <Trash2 size={16} /> Clear All
+          </button>
           <span>v1.0.0</span>
           <a href="https://todo.k6n.net" target="_blank" rel="noreferrer" className="hover:text-github-accent flex items-center gap-1">
             API <ExternalLink size={14} />
