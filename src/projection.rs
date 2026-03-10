@@ -184,41 +184,25 @@ where
                 // 3. Catch up from EventStore
                 let mut stream = self.event_store.read_all_from(current_seq + 1);
                 while let Some(Ok(event)) = stream.next().await {
-                    let mut needs_snapshot = false;
-                    let mut state_clone = None;
                     {
                         let mut state_lock = self.state.write();
                         if let Ok(()) = self.projection.handle(&mut state_lock, &event) {
                             current_seq = current_seq.max(event.global_sequence_num);
-                            events_since_snapshot += 1;
                             if let Some(v) = &self.version {
                                 v.fetch_add(1, Ordering::Relaxed);
                             }
-                            if events_since_snapshot >= self.snapshot_interval {
-                                events_since_snapshot = 0;
-                                state_clone = Some(state_lock.clone());
-                                needs_snapshot = true;
-                            }
-                        }
-                    }
-                    if needs_snapshot {
-                        if let Err(_e) = self.snapshot_store
-                            .save(self.projection.name(), current_seq, &state_clone.unwrap())
-                            .await
-                        {
-                            // Log error if needed
                         }
                     }
                     tokio::task::yield_now().await;
                 }
                 // Save snapshot after catch-up if there were unsaved events.
-                if events_since_snapshot > 0 {
+                // Save snapshot after catch-up.
+                {
                     let state_clone = self.state.read().clone();
                     let _ = self
                         .snapshot_store
                         .save(self.projection.name(), current_seq, &state_clone)
                         .await;
-                    events_since_snapshot = 0;
                 }
 
                 // 4. Process real-time events
@@ -418,38 +402,19 @@ where
                     // Catch up from EventStore
                     let mut stream = self.event_store.read_all_from(current_seq + 1);
                     while let Some(Ok(event)) = stream.next().await {
-                        let mut needs_snapshot = false;
-                        let mut state_clone = None;
                         {
                             let mut state_lock = self.state.lock();
                             if let Ok(()) = self.projection.handle(&mut state_lock, &event) {
                                 current_seq = current_seq.max(event.global_sequence_num);
-                                events_since_snapshot += 1;
                                 if let Some(v) = &self.version {
                                     v.fetch_add(1, Ordering::Relaxed);
                                 }
-                                if events_since_snapshot >= self.snapshot_interval {
-                                    events_since_snapshot = 0;
-                                    state_clone = Some(state_lock.clone());
-                                    needs_snapshot = true;
-                                }
                             }
                         }
-                        if needs_snapshot {
-                            if let Err(e) = self
-                                .snapshot_store
-                                .save(self.projection.name(), current_seq, &state_clone.unwrap())
-                                .await
-                            {
-                                eprintln!(
-                                    "Failed to save snapshot during catch-up for {}: {}",
-                                    self.projection.name(),
-                                    e
-                                );
-                            }
-                        }
+                        tokio::task::yield_now().await;
                     }
-                    if events_since_snapshot > 0 {
+                    // Save snapshot after catch-up.
+                    {
                         let state_clone = self.state.lock().clone();
                         if let Err(e) = self
                             .snapshot_store
@@ -462,7 +427,6 @@ where
                                 e
                             );
                         }
-                        events_since_snapshot = 0;
                     }
 
                     // Process live events

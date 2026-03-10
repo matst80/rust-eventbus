@@ -1,6 +1,6 @@
 use rust_eventbus::event::{Event, EventPayload};
 use rust_eventbus::store::{FileEventStore, EventStore};
-use rust_eventbus::distributed::{TcpPubSub, NodeDiscovery, Node, DistributedError, DistributedPubSub};
+use rust_eventbus::distributed::{TcpPubSub, NodeDiscovery, Node, DistributedError, DistributedPubSub, DiscoveryHandler};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -19,6 +19,7 @@ impl EventPayload for TestEvent {
 
 /// A "Split" Discovery implementation that allows us to simulate network partitions.
 struct SplitDiscovery {
+    my_id: Uuid,
     nodes: Arc<parking_lot::Mutex<Vec<Node>>>,
     partitioned: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -26,20 +27,44 @@ struct SplitDiscovery {
 #[async_trait]
 impl NodeDiscovery for SplitDiscovery {
     async fn discover_nodes(&self) -> Result<Vec<Node>, DistributedError> {
+        let all_nodes = self.nodes.lock().clone();
         if self.partitioned.load(std::sync::atomic::Ordering::Relaxed) {
-             // When partitioned, discovery returns nothing or only self
-             // To make it "severe", we still return the nodes so the mesh *attempts* to connect but fails or is blocked.
-             // Actually, if we return nothing, they won't even try.
-             // To simulate a real network partition where they *think* they are connected but aren't:
-             return Ok(vec![]);
+             // Return only ourself to trigger removal of others
+             return Ok(all_nodes.into_iter().filter(|n| n.id == self.my_id).collect());
         }
-        Ok(self.nodes.lock().clone())
+        Ok(all_nodes)
     }
     async fn register(&self, node: Node) -> Result<(), DistributedError> {
         self.nodes.lock().push(node);
         Ok(())
     }
     async fn unregister(&self, _node: &Node) -> Result<(), DistributedError> { Ok(()) }
+    async fn watch(&self, handler: Arc<dyn DiscoveryHandler>) -> Result<(), DistributedError> {
+        let mut last_nodes = std::collections::HashSet::<String>::new();
+        loop {
+            if let Ok(nodes) = self.discover_nodes().await {
+                let current_addrs: std::collections::HashSet<String> = nodes.iter().map(|n| n.address.clone()).collect();
+                
+                // Added
+                for node in &nodes {
+                    if !last_nodes.contains(&node.address) {
+                        handler.on_node_added(node.clone()).await;
+                    }
+                }
+                
+                // Removed (Not explicitly needed for the test's original logic but good for completeness)
+                // Actually we NEED removals to test the new functionality!
+                for addr in &last_nodes {
+                    if !current_addrs.contains(addr) {
+                        handler.on_node_removed(Node { id: Uuid::nil(), address: addr.clone() }).await;
+                    }
+                }
+                
+                last_nodes = current_addrs;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -56,10 +81,12 @@ async fn test_severe_split_brain_divergence() {
     let node2_id = Uuid::new_v4();
 
     let discovery1 = Arc::new(SplitDiscovery {
+        my_id: node1_id,
         nodes: Arc::new(parking_lot::Mutex::new(vec![])),
         partitioned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let discovery2 = Arc::new(SplitDiscovery {
+        my_id: node2_id,
         nodes: Arc::new(parking_lot::Mutex::new(vec![])),
         partitioned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
@@ -105,6 +132,13 @@ async fn test_severe_split_brain_divergence() {
         }
     });
 
+    // Start mesh managers
+    mesh1.clone().start_background_manager().await;
+    mesh2.clone().start_background_manager().await;
+
+    // Allow time for background connection tasks to establish connections
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
     // --- PHASE 1: Healthy Cluster ---
     let ev1 = Event::new("shared", 1, TestEvent { data: "initial".into() });
     let stored = store1.append(vec![ev1.clone()]).await.unwrap();
@@ -126,6 +160,8 @@ async fn test_severe_split_brain_divergence() {
     // Node 1 writes while partitioned
     let ev2_node1 = Event::new("shared", 2, TestEvent { data: "node1_only".into() });
     let stored1 = store1.append(vec![ev2_node1]).await.unwrap();
+    // Allow time for discovery cache to expire (5s) and connections to be dropped
+    tokio::time::sleep(Duration::from_secs(6)).await;
     mesh1.publish(&stored1[0]).await.unwrap();
 
     // Node 2 writes while partitioned
@@ -158,6 +194,9 @@ async fn test_severe_split_brain_divergence() {
     // --- PHASE 3: Heal Partition (The "Severe" part) ---
     discovery1.partitioned.store(false, std::sync::atomic::Ordering::Relaxed);
     discovery2.partitioned.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Allow time for reconnection
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Node 1 writes a new event after healing
     let ev3_node1 = Event::new("shared", 3, TestEvent { data: "after_heal".into() });

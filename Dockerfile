@@ -15,7 +15,8 @@ COPY . .
 # Build the example with optimizations
 # RUSTFLAGS allows us to pass architecture-specific hints if we know the target
 # For a generic arm64 build, we mostly rely on the release profile.
-RUN cargo build --release --example todo_app --features mimalloc
+RUN cargo build --release --example todo_app 
+# --features mimalloc
 
 # Runtime Stage - Distroless for security and size
 FROM gcr.io/distroless/cc-debian12

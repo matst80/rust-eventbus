@@ -190,48 +190,6 @@ impl FileEventStore {
         })
     }
 
-    /// Read all events from the file into a Vec (helper for compaction/truncation).
-    async fn read_all_events<E: EventPayload>(&self) -> Result<Vec<Event<E>>, StoreError> {
-        let path = &self.file_path;
-        match File::open(path).await {
-            Ok(f) => {
-                let mut reader = BufReader::new(f);
-                let mut events = Vec::new();
-                loop {
-                    let mut len_buf = [0u8; 4];
-                    match reader.read_exact(&mut len_buf).await {
-                        Ok(_) => {
-                            let len = u32::from_le_bytes(len_buf) as usize;
-                            let mut data = vec![0u8; len];
-                            reader.read_exact(&mut data).await?;
-                            let event: Event<E> = bincode::deserialize(&data)?;
-                            events.push(event);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) => return Err(StoreError::Io(e)),
-                    }
-                }
-                Ok(events)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(StoreError::Io(e)),
-        }
-    }
-
-    /// Write events to a temp file then atomically rename over the main file.
-    async fn atomic_rewrite<E: EventPayload>(&self, events: &[Event<E>]) -> Result<(), StoreError> {
-        let tmp_path = self.file_path.with_extension("tmp");
-        let mut file = File::create(&tmp_path).await?;
-        for event in events {
-            let bytes = bincode::serialize(event)?;
-            let len = bytes.len() as u32;
-            file.write_all(&len.to_le_bytes()).await?;
-            file.write_all(&bytes).await?;
-        }
-        file.sync_all().await?;
-        tokio::fs::rename(&tmp_path, &self.file_path).await?;
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -284,13 +242,14 @@ where
     fn read_all_from(&self, start_sequence: u64) -> BoxStream<'_, Result<Event<E>, StoreError>> {
         let path = self.file_path.clone();
 
-        let stream = unfold(None, move |mut state: Option<BufReader<File>>| {
+        // State: (Reader, Buffer)
+        let stream = unfold(None, move |mut state: Option<(BufReader<File>, Vec<u8>)>| {
             let path_clone = path.clone();
             async move {
                 if state.is_none() {
                     match File::open(&path_clone).await {
                         Ok(f) => {
-                            state = Some(BufReader::new(f));
+                            state = Some((BufReader::new(f), Vec::with_capacity(1024)));
                         }
                         Err(e) => {
                             if e.kind() == std::io::ErrorKind::NotFound {
@@ -301,32 +260,40 @@ where
                     }
                 }
 
-                let mut reader = state.expect("State should not be None");
+                let (mut reader, mut buf) = state.expect("State should not be None");
                 loop {
                     let mut len_buf = [0u8; 4];
                     match reader.read_exact(&mut len_buf).await {
                         Ok(_) => {
                             let len = u32::from_le_bytes(len_buf) as usize;
-                            let mut data = vec![0u8; len];
-                            match reader.read_exact(&mut data).await {
-                                Ok(_) => match bincode::deserialize::<Event<E>>(&data) {
-                                    Ok(event) => {
-                                        if event.global_sequence_num >= start_sequence {
-                                            return Some((Ok(event), Some(reader)));
+                            if buf.len() < len {
+                                buf.resize(len, 0);
+                            }
+                            let data = &mut buf[..len];
+                            match reader.read_exact(data).await {
+                                Ok(_) => {
+                                    // Optimization: Peek at the global_sequence_num without full deserialization if possible.
+                                    match bincode::deserialize::<Event<E>>(data) {
+                                        Ok(event) => {
+                                            if event.global_sequence_num >= start_sequence {
+                                                return Some((Ok(event), Some((reader, buf))));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            return Some((
+                                                Err(StoreError::Serialization(e)),
+                                                Some((reader, buf)),
+                                            ))
                                         }
                                     }
-                                    Err(e) => {
-                                        return Some((
-                                            Err(StoreError::Serialization(e)),
-                                            Some(reader),
-                                        ))
-                                    }
-                                },
-                                Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
+                                }
+                                Err(e) => {
+                                    return Some((Err(StoreError::Io(e)), Some((reader, buf))))
+                                }
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-                        Err(e) => return Some((Err(StoreError::Io(e)), Some(reader))),
+                        Err(e) => return Some((Err(StoreError::Io(e)), Some((reader, buf)))),
                     }
                 }
             }
@@ -336,56 +303,116 @@ where
     }
 
     async fn compact(&self, rule: CompactionRule<E>) -> Result<u64, StoreError> {
-        let inner = self.inner.lock().await;
-        let all_events: Vec<Event<E>> = self.read_all_events().await?;
-        let original_count = all_events.len() as u64;
+        let mut guard = self.inner.lock().await; // Guard the whole operation
 
-        // Keep only the latest event per aggregate_id (highest global_sequence_num).
-        let mut latest: HashMap<String, Event<E>> = HashMap::new();
-        for event in all_events {
-            let entry = latest
-                .entry(event.aggregate_id.clone())
-                .or_insert_with(|| event.clone());
-            if event.global_sequence_num > entry.global_sequence_num {
-                *entry = event;
+        // Pass 1: Streaming through the file to find the latest sequence for each aggregate.
+        let mut latest_map: HashMap<String, u64> = HashMap::new();
+        let mut original_count = 0u64;
+        
+        {
+            let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
+            while let Some(res) = stream.next().await {
+                let event = res?;
+                original_count += 1;
+                let entry = latest_map.entry(event.aggregate_id.clone()).or_insert(0);
+                if event.global_sequence_num > *entry {
+                    *entry = event.global_sequence_num;
+                }
             }
         }
 
-        // Apply compaction rules:
-        // By default, we keep the latest. If PruneIf is provided, we remove aggregates
-        // where the latest event matches the predicate (e.g., is a 'Deleted' event).
+        // Apply "PruneIf" logic to our latest_map
         if let CompactionRule::PruneIf(predicate) = rule {
-            latest.retain(|_, ev| !(predicate)(&ev.payload));
+            // We need one more pass or we store the payloads. 
+            // Better: find which aggregates satisfy PruneIf.
+            let mut prune_set = std::collections::HashSet::new();
+            let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
+            while let Some(res) = stream.next().await {
+                let event = res?;
+                if let Some(&latest_seq) = latest_map.get(&event.aggregate_id) {
+                    if event.global_sequence_num == latest_seq {
+                        if (predicate)(&event.payload) {
+                            prune_set.insert(event.aggregate_id.clone());
+                        }
+                    }
+                }
+            }
+            for agg_id in prune_set {
+                latest_map.remove(&agg_id);
+            }
         }
 
-        let mut kept: Vec<Event<E>> = latest.into_values().collect();
-        kept.sort_by_key(|e| e.global_sequence_num);
+        // Pass 2: Streaming through again and writing kept events to a temp file.
+        let tmp_path = self.file_path.with_extension("compact.tmp");
+        let mut tmp_file = File::create(&tmp_path).await?;
+        let mut kept_count = 0u64;
+        let mut max_seq = 0u64;
+        let mut new_id_index = HashMap::new();
 
-        self.atomic_rewrite(&kept).await?;
-
-        // Update next_global_seq to be after the highest remaining event.
-        // We hold the lock so this is safe; drop it explicitly via the guard held above.
-        drop(inner);
-        let mut inner = self.inner.lock().await;
-        if let Some(last) = kept.last() {
-            inner.next_global_seq = last.global_sequence_num + 1;
+        {
+            let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
+            while let Some(res) = stream.next().await {
+                let event = res?;
+                if let Some(&latest_seq) = latest_map.get(&event.aggregate_id) {
+                    if event.global_sequence_num == latest_seq {
+                        let bytes = bincode::serialize(&event)?;
+                        let len = bytes.len() as u32;
+                        tmp_file.write_all(&len.to_le_bytes()).await?;
+                        tmp_file.write_all(&bytes).await?;
+                        
+                        kept_count += 1;
+                        max_seq = max_seq.max(event.global_sequence_num);
+                        new_id_index.insert(event.id, event.global_sequence_num);
+                    }
+                }
+            }
         }
+        
+        tmp_file.sync_all().await?;
+        tokio::fs::rename(&tmp_path, &self.file_path).await?;
 
-        Ok(original_count - kept.len() as u64)
+        // Update inner state
+        guard.id_index = new_id_index;
+        guard.next_global_seq = max_seq + 1;
+
+        Ok(original_count - kept_count)
     }
 
     async fn truncate_before(&self, min_seq: u64) -> Result<u64, StoreError> {
-        let _inner = self.inner.lock().await;
-        let all_events: Vec<Event<E>> = self.read_all_events().await?;
-        let original_count = all_events.len() as u64;
+        let mut guard = self.inner.lock().await;
+        let tmp_path = self.file_path.with_extension("truncate.tmp");
+        let mut tmp_file = File::create(&tmp_path).await?;
+        
+        let mut original_count = 0u64;
+        let mut kept_count = 0u64;
+        let mut max_seq = 0u64;
+        let mut new_id_index = HashMap::new();
 
-        let kept: Vec<Event<E>> = all_events
-            .into_iter()
-            .filter(|e| e.global_sequence_num > min_seq)
-            .collect();
+        {
+            let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
+            while let Some(res) = stream.next().await {
+                let event = res?;
+                original_count += 1;
+                if event.global_sequence_num > min_seq {
+                    let bytes = bincode::serialize(&event)?;
+                    let len = bytes.len() as u32;
+                    tmp_file.write_all(&len.to_le_bytes()).await?;
+                    tmp_file.write_all(&bytes).await?;
+                    
+                    kept_count += 1;
+                    max_seq = max_seq.max(event.global_sequence_num);
+                    new_id_index.insert(event.id, event.global_sequence_num);
+                }
+            }
+        }
 
-        self.atomic_rewrite(&kept).await?;
-        Ok(original_count - kept.len() as u64)
+        tmp_file.sync_all().await?;
+        tokio::fs::rename(&tmp_path, &self.file_path).await?;
+
+        guard.id_index = new_id_index;
+        guard.next_global_seq = max_seq + 1;
+
+        Ok(original_count - kept_count)
     }
 }
 

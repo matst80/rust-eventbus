@@ -223,9 +223,20 @@ async fn create_todo(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    // 🛡️ [CONSISTENCY] Ensure we can broadcast to the cluster before returning success
     for e in stored {
         let _ = state.bus.publish(e.clone());
-        let _ = state.mesh.publish(&e).await;
+        if let Err(err) = state.mesh.publish(&e).await {
+            eprintln!("Failed to publish to mesh: {:?}", err);
+            match err {
+                rust_eventbus::distributed::DistributedError::NoQuorum => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => {
+                    eprintln!("Mesh publish failed: {}. Data might diverge!", err);
+                }
+            }
+        }
     }
 
     let item = TodoItem {
@@ -248,9 +259,20 @@ async fn complete_todo(
         .append(vec![event])
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        
     for e in stored {
         let _ = state.bus.publish(e.clone());
-        let _ = state.mesh.publish(&e).await;
+        if let Err(err) = state.mesh.publish(&e).await {
+            eprintln!("Failed to publish to mesh: {:?}", err);
+            match err {
+                rust_eventbus::distributed::DistributedError::NoQuorum => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => {
+                    eprintln!("Mesh publish failed: {}. Data might diverge!", err);
+                }
+            }
+        }
     }
 
     Ok(StatusCode::OK)
@@ -274,7 +296,7 @@ async fn delete_todo(
         // Use limiter if we want to count this toward the 50 tasks
         let _permit = limiter.acquire_permit().await;
         let rule = CompactionRule::PruneIf(|payload| matches!(payload, TodoEvent::TodoDeleted));
-        match EventStore::<TodoEvent>::compact(es.as_ref(), rule).await {
+        match <dyn EventStore<TodoEvent>>::compact(es.as_ref(), rule).await {
             Ok(removed) if removed > 0 => println!(
                 "🧹 [LOG COMPACTION] Removed {} stale events from log",
                 removed
@@ -286,7 +308,17 @@ async fn delete_todo(
 
     for e in stored {
         let _ = state.bus.publish(e.clone());
-        let _ = state.mesh.publish(&e).await;
+        if let Err(err) = state.mesh.publish(&e).await {
+            eprintln!("Failed to publish to mesh: {:?}", err);
+            match err {
+                rust_eventbus::distributed::DistributedError::NoQuorum => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => {
+                    eprintln!("Mesh publish failed: {}. Data might diverge!", err);
+                }
+            }
+        }
     }
 
     Ok(StatusCode::OK)
