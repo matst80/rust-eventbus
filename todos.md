@@ -18,21 +18,9 @@ This file outlines two parallel implementation paths: a libp2p (Gossipsub) path 
 
 ---
 
-## Path A — libp2p (Gossipsub) — decentralized, encrypted
-Milestones:
-1. Add dependency: `libp2p = "0.56"` (or latest compatible) + `async-compat` crates as needed.
-2. Prototype `examples/libp2p_demo.rs` that: creates a libp2p node, joins a Gossipsub topic, publishes/receives raw bytes; show two nodes gossiping locally.
-3. Implement `Libp2pAdapter` implementing `DistributedPubSub`:
-   - `publish(bytes)` publishes to a Gossipsub topic.
-   - `subscribe()` yields incoming messages as a `BoxStream`.
-   - Use libp2p's built-in peer discovery (mDNS) for local dev; make it configurable (mDNS on/off).
-   - Enable optional encryption/identity key handling (generate on startup or load from disk).
-4. Wire `examples/todo_app.rs` to use `Libp2pAdapter` behind the trait for one example run.
-5. Docs & notes: NAT, bootnodes, scaling considerations.
-
-Estimated effort: medium (libp2p learning curve + async integration).
 
 ---
+
 
 ## Path B — async-nats (brokered, durable)
 Milestones:
@@ -58,7 +46,6 @@ Estimated effort: small–medium (depends on JetStream integration).
 
 ## Next immediate steps (this iteration)
 - Finalize the adapter trait signatures in `src/distributed.rs`.
-- Implement the `examples/libp2p_demo.rs` prototype.
 
 ---
 
