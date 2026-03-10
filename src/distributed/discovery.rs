@@ -152,6 +152,7 @@ impl NodeDiscovery for DnsNodeDiscovery {
 
                 // Added
                 for addr in current_nodes.difference(&last_nodes) {
+                    tracing::info!("Discovery: node added -> {}", addr);
                     handler
                         .on_node_added(Node {
                             id: Uuid::nil(),
@@ -162,6 +163,7 @@ impl NodeDiscovery for DnsNodeDiscovery {
 
                 // Removed
                 for addr in last_nodes.difference(&current_nodes) {
+                    tracing::info!("Discovery: node removed -> {}", addr);
                     handler
                         .on_node_removed(Node {
                             id: Uuid::nil(),

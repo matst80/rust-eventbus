@@ -106,10 +106,23 @@ impl TcpPubSub {
             advertised_addr: self.advertised_addr.clone(),
         });
 
+        // Register this node with the discovery service so other nodes (and discoverers)
+        // can be made aware of this node and exclude it if desired.
+        let _ = discovery
+            .register(Node {
+                id: self.node_id,
+                address: self.advertised_addr.clone(),
+            })
+            .await;
+
         // Discovery Watching
-        let h_watch = tokio::spawn(async move {
-            let _ = discovery.watch(handler).await;
-        });
+        let h_watch = {
+            let discovery = discovery.clone();
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let _ = discovery.watch(handler).await;
+            })
+        };
 
         // Peer Reconnection
         let self_recon = self.clone();

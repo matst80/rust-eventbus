@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use uuid::Uuid;
-
 use rust_eventbus::{
     bus::EventBus,
     distributed::DistributedPubSub,
@@ -23,20 +22,6 @@ use rust_eventbus::{
     projection::{DurableProjectionActor, EphemeralProjectionActor, Projection, ProjectionError},
     store::{CompactionRule, EventStore, FileEventStore},
 };
-
-fn same_endpoint(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-
-    match (
-        a.parse::<std::net::SocketAddr>(),
-        b.parse::<std::net::SocketAddr>(),
-    ) {
-        (Ok(lhs), Ok(rhs)) => lhs.ip() == rhs.ip() && lhs.port() == rhs.port(),
-        _ => false,
-    }
-}
 
 // 1. Define Domain Events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,7 +251,7 @@ async fn complete_todo(
         .append(vec![event])
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        
+
     for e in stored {
         let _ = state.bus.publish(e.clone());
         if let Err(err) = state.mesh.publish(&e).await {
@@ -335,14 +320,14 @@ async fn clear_all(
     State(state): State<AppState>,
 ) -> Result<StatusCode, StatusCode> {
     println!("Node {} handling clear_all", state.node_id);
-    
+
     let event: Event<TodoEvent> = Event::new("system", 0, TodoEvent::ClearAll);
-    
+
     if let Err(err) = state.mesh.publish(&event).await {
         eprintln!("Failed to broadcast ClearAll: {:?}", err);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    
+
     // Also trigger locally
     let _ = <dyn EventStore<TodoEvent>>::truncate_before(state.event_store.as_ref(), u64::MAX).await;
     state.ephemeral_handle.reset();
@@ -383,7 +368,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lock_manager = cluster.lock_manager.clone();
         let mesh_bind_addr = cluster.mesh_bind_addr.clone();
         let mesh_advertised_addr = cluster.mesh_advertised_addr.clone();
-        let discovery_for_probe = cluster.discovery.clone();
         let data_dir = cluster.data_dir.clone();
 
         let listen_addr = format!("{}:{}", host, port);
@@ -407,7 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_version(projection_version.clone())
         .with_task_limiter(cluster.task_limiter.clone());
-        
+
         let ephemeral_handle = ephemeral_actor.get_handle();
         let projection_state = ephemeral_actor.get_state();
         ephemeral_actor.spawn().await;
@@ -424,24 +408,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let durable_handle = durable_actor.get_handle();
         durable_actor.spawn().await;
 
-        let self_mesh_addr = mesh_advertised_addr.clone();
-        let limiter_discovery = cluster.task_limiter.clone();
-        limiter_discovery.spawn(async move {
-            loop {
-                match discovery_for_probe.discover_nodes().await {
-                    Ok(nodes) => {
-                        let peer_count = nodes
-                            .iter()
-                            .filter(|n| !same_endpoint(&n.address, &self_mesh_addr))
-                            .count();
-                        tracing::info!("Discovery probe: {} peer(s) visible", peer_count);
-                    }
-                    Err(e) => tracing::warn!("Discovery probe failed: {}", e),
-                }
-
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            }
-        }).await;
 
         let app_state = AppState {
             node_id,
@@ -461,7 +427,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let limiter_mesh = cluster.task_limiter.clone();
         let e_handle = ephemeral_handle.clone();
         let d_handle = durable_handle.clone();
-        
+
         limiter_mesh.spawn(async move {
             let mut incoming = mesh_for_subscribe.subscribe().await;
             while let Some(result) = incoming.next().await {
