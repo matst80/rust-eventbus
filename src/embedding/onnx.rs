@@ -2,8 +2,9 @@ use std::path::Path;
 use anyhow::Result;
 use ndarray::{Array2, Axis};
 use ort::{
-    session::{builder::AutoDevicePolicy, builder::GraphOptimizationLevel, builder::SessionBuilder, Session},
+    session::{builder::GraphOptimizationLevel, Session},
     value::Value,
+    execution_providers::{CUDAExecutionProvider, CPUExecutionProvider, TensorRTExecutionProvider},
 };
 use parking_lot::Mutex;
 use tokenizers::Tokenizer;
@@ -18,14 +19,38 @@ impl OnnxEmbeddingService {
         let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
 
-        let session = SessionBuilder::new()
-            .map_err(|e| anyhow::anyhow!("Failed to create session builder: {:?}", e))?
-            .with_auto_device(ort::session::builder::AutoDevicePolicy::MaxPerformance)
-            .map_err(|e| anyhow::anyhow!("Failed to set auto device: {:?}", e))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow::anyhow!("Failed to set optimization level: {:?}", e))?
-            .commit_from_file(model_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load model: {:?}", e))?;
+        let mut builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Failed to create builder: {:?}", e))?;
+        
+        builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Failed to set optimization: {:?}", e))?;
+
+        // Try GPU (TensorRT then CUDA)
+        let session = match builder.clone().with_execution_providers([
+            TensorRTExecutionProvider::default().build(),
+            CUDAExecutionProvider::default().build(),
+        ]) {
+            Ok(mut b) => match b.commit_from_file(&model_path) {
+                Ok(s) => {
+                    println!("Successfully initialized ONNX with GPU (TensorRT/CUDA)");
+                    s
+                },
+                Err(e) => {
+                    eprintln!("Failed to commit GPU session: {:?}. Falling back to CPU.", e);
+                    builder.with_execution_providers([CPUExecutionProvider::default().build()])
+                        .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
+                        .commit_from_file(model_path)
+                        .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to set GPU execution providers: {:?}. Falling back to CPU.", e);
+                builder.with_execution_providers([CPUExecutionProvider::default().build()])
+                    .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
+                    .commit_from_file(model_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
+            }
+        };
 
         Ok(Self { session: Mutex::new(session), tokenizer })
     }
@@ -35,7 +60,7 @@ impl OnnxEmbeddingService {
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(&[text.to_string()])?;
+        let results = self.embed_batch(&vec![text.to_string()])?;
         Ok(results.into_iter().next().unwrap())
     }
 
