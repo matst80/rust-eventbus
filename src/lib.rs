@@ -10,7 +10,9 @@ pub mod event;
 pub mod projection;
 pub mod store;
 pub mod task_limiter;
+pub mod embedding;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
 pub use projection::ProjectionHandle;
+
