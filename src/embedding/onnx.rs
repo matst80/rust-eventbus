@@ -4,7 +4,7 @@ use ndarray::{Array2, Axis};
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
     value::Value,
-    execution_providers::{CUDAExecutionProvider, CPUExecutionProvider, TensorRTExecutionProvider},
+    execution_providers::{CUDAExecutionProvider, CPUExecutionProvider, TensorRTExecutionProvider, CoreMLExecutionProvider},
 };
 use parking_lot::Mutex;
 use tokenizers::Tokenizer;
@@ -25,30 +25,41 @@ impl OnnxEmbeddingService {
         builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("Failed to set optimization: {:?}", e))?;
 
-        // Try GPU (TensorRT then CUDA)
-        let session = match builder.clone().with_execution_providers([
-            TensorRTExecutionProvider::default().build(),
-            CUDAExecutionProvider::default().build(),
-        ]) {
-            Ok(mut b) => match b.commit_from_file(&model_path) {
-                Ok(s) => {
-                    println!("Successfully initialized ONNX with GPU (TensorRT/CUDA)");
-                    s
+        let cpu_only = std::env::var("CPU_ONLY").map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false);
+
+        let session = if cpu_only {
+            println!("CPU_ONLY set. Initializing ONNX on CPU.");
+            builder.with_execution_providers([CPUExecutionProvider::default().build()])
+                .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
+                .commit_from_file(model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
+        } else {
+            // Try GPU (TensorRT then CUDA then CoreML)
+            match builder.clone().with_execution_providers([
+                CoreMLExecutionProvider::default().build(),
+                TensorRTExecutionProvider::default().build(),
+                CUDAExecutionProvider::default().build(),
+            ]) {
+                Ok(mut b) => match b.commit_from_file(&model_path) {
+                    Ok(s) => {
+                        println!("Successfully initialized ONNX with GPU (TensorRT/CUDA/CoreML)");
+                        s
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to commit GPU session: {:?}. Falling back to CPU.", e);
+                        builder.with_execution_providers([CPUExecutionProvider::default().build()])
+                            .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
+                            .commit_from_file(model_path)
+                            .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
+                    }
                 },
                 Err(e) => {
-                    eprintln!("Failed to commit GPU session: {:?}. Falling back to CPU.", e);
+                    eprintln!("Failed to set GPU execution providers: {:?}. Falling back to CPU.", e);
                     builder.with_execution_providers([CPUExecutionProvider::default().build()])
                         .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
                         .commit_from_file(model_path)
                         .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
                 }
-            },
-            Err(e) => {
-                eprintln!("Failed to set GPU execution providers: {:?}. Falling back to CPU.", e);
-                builder.with_execution_providers([CPUExecutionProvider::default().build()])
-                    .map_err(|e| anyhow::anyhow!("Failed to set CPU provider: {:?}", e))?
-                    .commit_from_file(model_path)
-                    .map_err(|e| anyhow::anyhow!("Failed to load model on CPU: {:?}", e))?
             }
         };
 

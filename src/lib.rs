@@ -11,6 +11,8 @@ pub mod projection;
 pub mod store;
 pub mod task_limiter;
 pub mod embedding;
+pub mod crawler;
+pub mod parser;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
