@@ -137,7 +137,8 @@ impl FileEventStore {
             .open(&file_path)
             .await?;
 
-        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, Option<tokio::sync::oneshot::Sender<()>>)>(1024);
+        let (tx, mut rx) =
+            mpsc::channel::<(Vec<u8>, Option<tokio::sync::oneshot::Sender<()>>)>(1024);
 
         // Spawn a background worker to handle file writes asynchronously.
         tokio::spawn(async move {
@@ -171,7 +172,7 @@ impl FileEventStore {
 
                 if needs_sync || !sync_waiters.is_empty() {
                     let _ = file.sync_data().await;
-                    eprintln!("DEBUG: EventStore synced to disk");
+                    // eprintln!("DEBUG: EventStore synced to disk");
                     for stx in sync_waiters {
                         let _ = stx.send(());
                     }
@@ -189,7 +190,6 @@ impl FileEventStore {
             })),
         })
     }
-
 }
 
 #[async_trait]
@@ -243,61 +243,64 @@ where
         let path = self.file_path.clone();
 
         // State: (Reader, Buffer)
-        let stream = unfold(None, move |mut state: Option<(BufReader<File>, Vec<u8>)>| {
-            let path_clone = path.clone();
-            async move {
-                if state.is_none() {
-                    match File::open(&path_clone).await {
-                        Ok(f) => {
-                            state = Some((BufReader::new(f), Vec::with_capacity(1024)));
-                        }
-                        Err(e) => {
-                            if e.kind() == std::io::ErrorKind::NotFound {
-                                return None;
+        let stream = unfold(
+            None,
+            move |mut state: Option<(BufReader<File>, Vec<u8>)>| {
+                let path_clone = path.clone();
+                async move {
+                    if state.is_none() {
+                        match File::open(&path_clone).await {
+                            Ok(f) => {
+                                state = Some((BufReader::new(f), Vec::with_capacity(1024)));
                             }
-                            return Some((Err(StoreError::Io(e)), state));
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    return None;
+                                }
+                                return Some((Err(StoreError::Io(e)), state));
+                            }
                         }
                     }
-                }
 
-                let (mut reader, mut buf) = state.expect("State should not be None");
-                loop {
-                    let mut len_buf = [0u8; 4];
-                    match reader.read_exact(&mut len_buf).await {
-                        Ok(_) => {
-                            let len = u32::from_le_bytes(len_buf) as usize;
-                            if buf.len() < len {
-                                buf.resize(len, 0);
-                            }
-                            let data = &mut buf[..len];
-                            match reader.read_exact(data).await {
-                                Ok(_) => {
-                                    // Optimization: Peek at the global_sequence_num without full deserialization if possible.
-                                    match bincode::deserialize::<Event<E>>(data) {
-                                        Ok(event) => {
-                                            if event.global_sequence_num >= start_sequence {
-                                                return Some((Ok(event), Some((reader, buf))));
+                    let (mut reader, mut buf) = state.expect("State should not be None");
+                    loop {
+                        let mut len_buf = [0u8; 4];
+                        match reader.read_exact(&mut len_buf).await {
+                            Ok(_) => {
+                                let len = u32::from_le_bytes(len_buf) as usize;
+                                if buf.len() < len {
+                                    buf.resize(len, 0);
+                                }
+                                let data = &mut buf[..len];
+                                match reader.read_exact(data).await {
+                                    Ok(_) => {
+                                        // Optimization: Peek at the global_sequence_num without full deserialization if possible.
+                                        match bincode::deserialize::<Event<E>>(data) {
+                                            Ok(event) => {
+                                                if event.global_sequence_num >= start_sequence {
+                                                    return Some((Ok(event), Some((reader, buf))));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                return Some((
+                                                    Err(StoreError::Serialization(e)),
+                                                    Some((reader, buf)),
+                                                ))
                                             }
                                         }
-                                        Err(e) => {
-                                            return Some((
-                                                Err(StoreError::Serialization(e)),
-                                                Some((reader, buf)),
-                                            ))
-                                        }
+                                    }
+                                    Err(e) => {
+                                        return Some((Err(StoreError::Io(e)), Some((reader, buf))))
                                     }
                                 }
-                                Err(e) => {
-                                    return Some((Err(StoreError::Io(e)), Some((reader, buf))))
-                                }
                             }
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+                            Err(e) => return Some((Err(StoreError::Io(e)), Some((reader, buf)))),
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-                        Err(e) => return Some((Err(StoreError::Io(e)), Some((reader, buf)))),
                     }
                 }
-            }
-        });
+            },
+        );
 
         stream.boxed()
     }
@@ -308,7 +311,7 @@ where
         // Pass 1: Streaming through the file to find the latest sequence for each aggregate.
         let mut latest_map: HashMap<String, u64> = HashMap::new();
         let mut original_count = 0u64;
-        
+
         {
             let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
             while let Some(res) = stream.next().await {
@@ -323,7 +326,7 @@ where
 
         // Apply "PruneIf" logic to our latest_map
         if let CompactionRule::PruneIf(predicate) = rule {
-            // We need one more pass or we store the payloads. 
+            // We need one more pass or we store the payloads.
             // Better: find which aggregates satisfy PruneIf.
             let mut prune_set = std::collections::HashSet::new();
             let mut stream = <Self as EventStore<E>>::read_all_from(self, 0);
@@ -359,7 +362,7 @@ where
                         let len = bytes.len() as u32;
                         tmp_file.write_all(&len.to_le_bytes()).await?;
                         tmp_file.write_all(&bytes).await?;
-                        
+
                         kept_count += 1;
                         max_seq = max_seq.max(event.global_sequence_num);
                         new_id_index.insert(event.id, event.global_sequence_num);
@@ -367,7 +370,7 @@ where
                 }
             }
         }
-        
+
         tmp_file.sync_all().await?;
         tokio::fs::rename(&tmp_path, &self.file_path).await?;
 
@@ -382,7 +385,7 @@ where
         let mut guard = self.inner.lock().await;
         let tmp_path = self.file_path.with_extension("truncate.tmp");
         let mut tmp_file = File::create(&tmp_path).await?;
-        
+
         let mut original_count = 0u64;
         let mut kept_count = 0u64;
         let mut max_seq = 0u64;
@@ -398,7 +401,7 @@ where
                     let len = bytes.len() as u32;
                     tmp_file.write_all(&len.to_le_bytes()).await?;
                     tmp_file.write_all(&bytes).await?;
-                    
+
                     kept_count += 1;
                     max_seq = max_seq.max(event.global_sequence_num);
                     new_id_index.insert(event.id, event.global_sequence_num);
@@ -450,11 +453,17 @@ where
         match tokio::fs::read(&path).await {
             Ok(content) => {
                 let env: SnapshotEnvelope<S> = bincode::deserialize(&content)?;
-                eprintln!("DEBUG: SnapshotStore loaded {} at seq {}", projection_name, env.sequence_num);
+                eprintln!(
+                    "DEBUG: SnapshotStore loaded {} at seq {}",
+                    projection_name, env.sequence_num
+                );
                 Ok(Some((env.sequence_num, env.state)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("DEBUG: SnapshotStore found no snapshot for {}", projection_name);
+                eprintln!(
+                    "DEBUG: SnapshotStore found no snapshot for {}",
+                    projection_name
+                );
                 Ok(None)
             }
             Err(e) => Err(StoreError::Io(e)),
@@ -486,7 +495,10 @@ where
         tmp_file.sync_data().await?;
 
         tokio::fs::rename(tmp_path, path).await?;
-        eprintln!("DEBUG: SnapshotStore saved {} at seq {}", projection_name, sequence_num);
+        eprintln!(
+            "DEBUG: SnapshotStore saved {} at seq {}",
+            projection_name, sequence_num
+        );
         Ok(())
     }
 

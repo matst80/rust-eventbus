@@ -2,18 +2,19 @@ use anyhow::{Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::handler::viewport::Viewport;
 use futures::StreamExt;
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use super::event::CrawlerEvent;
+use crate::app_event::AppEvent;
 use crate::bus::EventBus;
 use crate::event::Event;
-use crate::app_event::AppEvent;
 use crate::parser::{Chunk, ChunkerOptions, Extractor, MarkdownChunker};
-use super::event::CrawlerEvent;
 
 /// Configuration for the CrawlerService.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrawlerConfig {
     /// Number of concurrent crawl tasks (runners).
     pub concurrency: usize,
@@ -21,6 +22,22 @@ pub struct CrawlerConfig {
     pub headless: bool,
     /// The default user data directory. If None, a temporary one will be created.
     pub user_data_dir: Option<std::path::PathBuf>,
+    /// Delegate used to decide whether a URL should be skipped.
+    pub should_exclude_url: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Maximum number of chunks emitted per crawled page.
+    pub max_chunks: usize,
+}
+
+impl fmt::Debug for CrawlerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CrawlerConfig")
+            .field("concurrency", &self.concurrency)
+            .field("headless", &self.headless)
+            .field("user_data_dir", &self.user_data_dir)
+            .field("should_exclude_url", &"<delegate>")
+            .field("max_chunks", &self.max_chunks)
+            .finish()
+    }
 }
 
 impl Default for CrawlerConfig {
@@ -29,6 +46,10 @@ impl Default for CrawlerConfig {
             concurrency: 2,
             headless: true,
             user_data_dir: None,
+            should_exclude_url: Arc::new(|url: &str| {
+                url == "https://doc.rust-lang.org/releases.html"
+            }),
+            max_chunks: 50,
         }
     }
 }
@@ -47,8 +68,10 @@ impl CrawlerService {
 
     /// Starts the crawler service loop.
     pub async fn run(&self) -> Result<()> {
-        info!("Starting CrawlerService (concurrency: {}, headless: {})...", 
-            self.config.concurrency, self.config.headless);
+        info!(
+            "Starting CrawlerService (concurrency: {}, headless: {})...",
+            self.config.concurrency, self.config.headless
+        );
 
         // Prepare User Data Directory to avoid ProcessSingleton errors
         let _temp_dir;
@@ -59,7 +82,7 @@ impl CrawlerService {
                 height: 1080,
                 ..Default::default()
             });
-            
+
         if !self.config.headless {
             builder = builder.with_head();
         }
@@ -92,7 +115,8 @@ impl CrawlerService {
         }
 
         let (browser, mut handler) = Browser::launch(
-            builder.build()
+            builder
+                .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build browser config: {}", e))?,
         )
         .await?;
@@ -119,6 +143,8 @@ impl CrawlerService {
             let browser_clone = Arc::clone(&browser);
             let bus_clone = Arc::clone(&self.bus);
             let rx_worker = Arc::clone(&shared_rx);
+            let should_exclude_url = Arc::clone(&self.config.should_exclude_url);
+            let max_chunks = self.config.max_chunks;
 
             tokio::spawn(async move {
                 info!("Runner #{} started", i);
@@ -129,17 +155,45 @@ impl CrawlerService {
                     };
 
                     if let Some(event) = event {
-                        if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, wait_selector }) = &event.payload {
+                        if let AppEvent::Crawler(CrawlerEvent::CrawlRequested {
+                            url,
+                            wait_selector,
+                        }) = &event.payload
+                        {
                             let url = url.clone();
                             let wait_selector = wait_selector.clone();
+
+                            if should_exclude_url(&url) {
+                                info!("Runner #{} skipping excluded URL: {}", i, url);
+                                continue;
+                            }
+
                             info!("Runner #{} processing: {}", i, url);
-                            match Self::process_crawl(browser_clone.clone(), &url, wait_selector).await {
+                            match Self::process_crawl(
+                                browser_clone.clone(),
+                                &url,
+                                wait_selector,
+                                max_chunks,
+                            )
+                            .await
+                            {
                                 Ok((title, links, chunks)) => {
-                                    info!("Runner #{} crawled: {} ({} links, {} chunks)", i, url, links.len(), chunks.len());
+                                    info!(
+                                        "Runner #{} crawled: {} ({} links, {} chunks)",
+                                        i,
+                                        url,
+                                        links.len(),
+                                        chunks.len()
+                                    );
                                     let result_event = Event::new(
                                         event.aggregate_id.clone(),
                                         event.sequence_num + 1,
-                                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, title, links, chunks }),
+                                        AppEvent::Crawler(CrawlerEvent::PageIngested {
+                                            url,
+                                            title,
+                                            links,
+                                            chunks,
+                                        }),
                                     );
                                     let _ = bus_clone.publish(result_event);
                                 }
@@ -148,7 +202,10 @@ impl CrawlerService {
                                     let error_event = Event::new(
                                         event.aggregate_id.clone(),
                                         event.sequence_num + 1,
-                                        AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, error: e.to_string() }),
+                                        AppEvent::Crawler(CrawlerEvent::CrawlFailed {
+                                            url,
+                                            error: e.to_string(),
+                                        }),
                                     );
                                     let _ = bus_clone.publish(error_event);
                                 }
@@ -188,8 +245,16 @@ impl CrawlerService {
     /// Fetches the page, immediately converts the HTML to links + chunks in a blocking thread,
     /// and drops the raw HTML before returning. This ensures multi-megabyte Chrome DOM strings
     /// never enter the event-bus ring buffer.
-    async fn process_crawl(browser: Arc<Browser>, url: &str, wait_selector: Option<String>) -> Result<(String, Vec<String>, Vec<Chunk>)> {
-        let page = browser.new_page(url).await.context("Failed to open new page")?;
+    async fn process_crawl(
+        browser: Arc<Browser>,
+        url: &str,
+        wait_selector: Option<String>,
+        max_chunks: usize,
+    ) -> Result<(String, Vec<String>, Vec<Chunk>)> {
+        let page = browser
+            .new_page(url)
+            .await
+            .context("Failed to open new page")?;
 
         if let Some(selector) = wait_selector {
             info!("Waiting for selector: {}", selector);
@@ -197,11 +262,14 @@ impl CrawlerService {
                 .await
                 .context(format!("Failed to find selector: {}", selector))?;
         } else {
-            page.wait_for_navigation().await.context("Wait for navigation failed")?;
+            page.wait_for_navigation()
+                .await
+                .context("Wait for navigation failed")?;
         }
 
         let content = page.content().await.context("Failed to get page content")?;
-        let title = page.evaluate("document.title")
+        let title = page
+            .evaluate("document.title")
             .await?
             .into_value::<String>()
             .context("Failed to get page title")?;
@@ -212,19 +280,29 @@ impl CrawlerService {
         // Convert HTML → links + chunks in a blocking thread.
         // `content` is moved into the closure and freed after chunking — it never enters the bus.
         let url_owned = url.to_string();
-        let (links, chunks) = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
-            let html = scraper::Html::parse_document(&content);
-            let links = Extractor::extract_links(&html, &url_owned);
-            drop(html); // free DOM #1 before markdown conversion
+        let (links, chunks) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
+                let html = scraper::Html::parse_document(&content);
+                let links = Extractor::extract_links(&html, &url_owned);
+                drop(html); // free DOM #1 before markdown conversion
 
-            let markdown = Extractor::to_markdown(&content, &url_owned, &[]);
-            drop(content); // free the raw HTML string — it's no longer needed
+                let markdown = Extractor::to_markdown(&content, &url_owned, &[]);
+                drop(content); // free the raw HTML string — it's no longer needed
 
-            let chunks = MarkdownChunker::chunk(&markdown, &ChunkerOptions { max_size: 1000, ..Default::default() });
-            Ok((links, chunks))
-        })
-        .await
-        .context("Blocking extraction task panicked")??;
+                let mut chunks = MarkdownChunker::chunk(
+                    &markdown,
+                    &ChunkerOptions {
+                        max_size: 1000,
+                        ..Default::default()
+                    },
+                );
+                if chunks.len() > max_chunks {
+                    chunks.truncate(max_chunks);
+                }
+                Ok((links, chunks))
+            })
+            .await
+            .context("Blocking extraction task panicked")??;
 
         Ok((title, links, chunks))
     }

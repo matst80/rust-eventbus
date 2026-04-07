@@ -81,17 +81,18 @@ impl OnnxEmbeddingService {
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(vec![text.to_string()])?;
+        let results = self.embed_batch(&[text])?;
         Ok(results.into_iter().next().unwrap())
     }
 
-    pub fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_batch<S: AsRef<str>>(&self, texts: &[S]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
         let batch_size = texts.len();
-        let encodings = self.tokenizer.encode_batch(texts, true)
+        let input: Vec<&str> = texts.iter().map(|s| s.as_ref()).collect();
+        let encodings = self.tokenizer.encode_batch(input, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
         let seq_len = encodings[0].len();

@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         let start = Instant::now();
         let iters = 50;
         for _ in 0..iters {
-            let _ = service.embed_batch(&batch)?;
+            let _ = service.embed_batch(&batch);
         }
         let duration = start.elapsed();
         let total_reqs = iters * size;

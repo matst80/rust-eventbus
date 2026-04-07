@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use crate::event::EventPayload;
 use crate::crawler::event::CrawlerEvent;
-use crate::embedding::projection::EmbeddingEvent;
+use crate::embedding::event::EmbeddingEvent;
+use crate::event::EventPayload;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
@@ -14,9 +14,20 @@ pub enum AppEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum GraphEvent {
-    NodeCreated { id: String, metadata: std::collections::HashMap<String, String> },
-    EdgeAdded { from: String, to: String, relation: String, weight: f32 },
-    RequestEmbedding { id: String, content: String },
+    NodeCreated {
+        id: String,
+        metadata: std::collections::HashMap<String, String>,
+    },
+    EdgeAdded {
+        from: String,
+        to: String,
+        relation: String,
+        weight: f32,
+    },
+    RequestEmbedding {
+        id: String,
+        content: String,
+    },
 }
 
 impl EventPayload for AppEvent {

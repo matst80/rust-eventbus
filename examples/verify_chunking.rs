@@ -3,7 +3,7 @@ use std::path::Path;
 use rust_eventbus::parser::chunker::{MarkdownChunker, ChunkerOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let input_path = "examples/outputs/structured.html.md";
+    let input_path = "examples/outputs/docs.html.md";
     let output_dir = "examples/outputs/chunks";
 
     // Read markdown
