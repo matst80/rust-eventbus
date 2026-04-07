@@ -98,8 +98,13 @@ impl CrawlerService {
             builder = builder.user_data_dir(temp_path);
         }
 
-        // On Mac, try common Chrome/Chromium paths
-        if cfg!(target_os = "macos") {
+        // Find chrome/chromium binary
+        if let Ok(bin) = std::env::var("CHROME_BIN") {
+             if std::path::Path::new(&bin).exists() {
+                 info!("Using browser binary from CHROME_BIN: {}", bin);
+                 builder = builder.chrome_executable(bin);
+             }
+        } else if cfg!(target_os = "macos") {
             let paths = [
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
                 "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",

@@ -12,29 +12,48 @@ RUN apt-get update && apt-get install -y \
 # Copy the entire workspace
 COPY . .
 
-# Build the example with optimizations
-# RUSTFLAGS allows us to pass architecture-specific hints if we know the target
-# For a generic arm64 build, we mostly rely on the release profile.
-RUN cargo build --release --example todo_app 
-# --features mimalloc
+# Build the web_server example
+RUN cargo build --release --example web_server
 
-# Runtime Stage - Distroless for security and size
-FROM gcr.io/distroless/cc-debian12
+# Runtime Stage
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
+# Install chromium and CA certificates for HTTPS crawling
+RUN apt-get update && apt-get install -y \
+    chromium \
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy the binary from the builder stage
-COPY --from=builder /usr/src/app/target/release/examples/todo_app /app/todo_app
+COPY --from=builder /usr/src/app/target/release/examples/web_server /app/web_server
 
 # Environment defaults
 ENV PORT=3000
 ENV HOST=0.0.0.0
-ENV DATA_DIR=/app/data
 ENV RUST_LOG=info
+# chromiumoxide usually finds it, but we can be explicit if needed
+ENV CHROME_BIN=/usr/bin/chromium
+
+# Models and data will be stored here
+RUN mkdir -p /app/data/models
+VOLUME /app/data
 
 # Expose the API port
 EXPOSE 3000
 
 # Run the binary
-# Note: Data directory should be mounted as a volume in K8s
-CMD ["/app/todo_app"]
+CMD ["/app/web_server"]
