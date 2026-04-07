@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     let json = std::fs::read_to_string(state_path)?;
     let state: GraphState = serde_json::from_str(&json)?;
 
-    let query = "Rust ownership rules and borrowing";
+    let query = "multithreaded web server";
     println!("--- Query: '{}' ---", query);
 
     // --- STAGE 1: Retrieval (Bi-Encoder / Embeddings) ---

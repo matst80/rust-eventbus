@@ -37,7 +37,8 @@ enum DetailFocus {
 
 #[derive(Debug, Clone)]
 struct SearchResultItem {
-    score: f32,
+    vector_score: f32,
+    rerank_score: f32,
     id: String,
     title: String,
     section: String,
@@ -51,7 +52,7 @@ impl Item for SearchResultItem {
 
 impl Display for SearchResultItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{:.3}] {} - {}", self.score, self.title, self.section)
+        write!(f, "[R:{:.3} V:{:.3}] {} - {}", self.rerank_score, self.vector_score, self.title, self.section)
     }
 }
 
@@ -229,21 +230,55 @@ impl SearchModel {
         }
 
         let query_emb = self.onnx_service.embed(&self.query)?;
-        let mut results = Vec::new();
+        let mut initial_results = Vec::new();
 
+        // 1. STAGE 1: Vector Retrieval
         for (id, node) in &self.state.nodes {
             if let Some(node_emb) = &node.embedding {
                 let score = cosine_similarity(&query_emb, node_emb);
                 if score > 0.3 {
                     let title = node.metadata.get("title").or(node.metadata.get("page_title")).cloned().unwrap_or(id.clone());
                     let section = node.metadata.get("section").cloned().unwrap_or_default();
-                    results.push(SearchResultItem { score, id: id.clone(), title, section });
+                    let content = node.metadata.get("content").cloned().unwrap_or_default();
+                    initial_results.push((score, id.clone(), title, section, content));
                 }
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        self.results_list.set_items(results);
+        // Sort by vector score to get candidates
+        initial_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // 2. STAGE 2: Reranking (Top 20)
+        let query_terms: Vec<String> = self.query
+            .to_lowercase()
+            .split_whitespace()
+            .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let mut final_results = Vec::new();
+        for (vector_score, id, title, section, content) in initial_results.into_iter().take(20) {
+            let mut boost = 0.0;
+            let content_lower = content.to_lowercase();
+            for term in &query_terms {
+                if content_lower.contains(term) {
+                    boost += 0.1;
+                }
+            }
+            
+            final_results.push(SearchResultItem { 
+                vector_score, 
+                rerank_score: vector_score + boost, 
+                id, 
+                title, 
+                section 
+            });
+        }
+
+        // Sort by rerank score for final display
+        final_results.sort_by(|a, b| b.rerank_score.partial_cmp(&a.rerank_score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        self.results_list.set_items(final_results);
         Ok(())
     }
 
