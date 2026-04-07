@@ -17,9 +17,13 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Setup Tracing
+    // 1. Setup Tracing (Silence noisy chromiumoxide warnings)
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
+                .add_directive("chromiumoxide=error".parse().unwrap()),
+        )
         .init();
 
     let temp_dir = tempfile::tempdir()?;
@@ -34,9 +38,10 @@ async fn main() -> Result<()> {
     let snapshot_store = Arc::new(FileSnapshotStore::new(&snapshot_dir).await?);
 
     // 3. Initialize Crawler Service
+    let headless = std::env::var("HEADLESS").map(|v| v != "0" && v.to_lowercase() != "false").unwrap_or(true);
     let crawler_config = CrawlerConfig {
         concurrency: 1,
-        headless: true,
+        headless,
         should_exclude_url: Arc::new(|url: &str| url == "https://doc.rust-lang.org/releases.html"),
         max_chunks: 50,
         ..Default::default()
@@ -45,8 +50,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move { crawler.run().await });
 
     // 4. Initialize Embedding Service (Using Onnx)
-    let model_cache = std::path::PathBuf::from("data/models");
-    let downloader = ModelDownloader::new(&model_cache);
+    let model_cache = [
+        ".",
+        "data/models",
+    ].iter().find(|p| std::path::Path::new(p).exists()).cloned()
+    .unwrap_or("data/models");
+    let downloader = ModelDownloader::new(model_cache);
     let (model_path, tokenizer_path) = downloader.get_bge_small().await?;
     let onnx_service = Arc::new(OnnxEmbeddingService::new(&model_path, &tokenizer_path)?);
     let embedding_processor =
@@ -65,16 +74,17 @@ async fn main() -> Result<()> {
     graph_actor.spawn().await;
 
     // 6. Subscription for Extraction Logic (Multi-page Discovery & Chunking)
-    let start_url = "https://doc.rust-lang.org";
-    let start_domain = url::Url::parse(start_url)
+    let start_url = std::env::args().nth(1).unwrap_or_else(|| "https://doc.rust-lang.org".to_string());
+    let start_domain = url::Url::parse(&start_url)
         .ok()
         .and_then(|u| u.domain().map(|d| d.to_string()));
 
     let mut rx = bus.subscribe();
     let bus_for_extraction = Arc::clone(&bus);
     let visited = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-    let crawl_count = Arc::new(AtomicUsize::new(0));
-    let max_crawls = 50;
+    let requested_count = Arc::new(AtomicUsize::new(0));
+    let ingested_count = Arc::new(AtomicUsize::new(0));
+    let max_crawls = 200;
 
     fn normalize_url(u: &str) -> Option<String> {
         let mut parsed = url::Url::parse(u).ok()?;
@@ -85,10 +95,13 @@ async fn main() -> Result<()> {
         Some(parsed.to_string())
     }
 
-    if let Some(norm_start) = normalize_url(start_url) {
+    if let Some(norm_start) = normalize_url(&start_url) {
         visited.lock().insert(norm_start);
+        requested_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    let requested_for_discover = Arc::clone(&requested_count);
+    let ingested_for_discover = Arc::clone(&ingested_count);
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
             if let AppEvent::Crawler(CrawlerEvent::PageIngested {
@@ -98,6 +111,7 @@ async fn main() -> Result<()> {
                 chunks,
             }) = &event.payload
             {
+                ingested_for_discover.fetch_add(1, Ordering::Relaxed);
                 info!(
                     "Pipeline: Page ingested {} ({} links, {} chunks)",
                     url,
@@ -120,9 +134,9 @@ async fn main() -> Result<()> {
                             let is_same_domain =
                                 target_domain.is_some() && target_domain == start_domain.as_deref();
 
-                            if is_same_domain && crawl_count.load(Ordering::Relaxed) < max_crawls {
+                            if is_same_domain && requested_for_discover.load(Ordering::Relaxed) < max_crawls {
                                 visited_lock.insert(normalized.clone());
-                                crawl_count.fetch_add(1, Ordering::Relaxed);
+                                requested_for_discover.fetch_add(1, Ordering::Relaxed);
 
                                 info!("Pipeline: Queuing same-domain link: {}", normalized);
                                 let _ = bus_for_extraction.publish(Event::new(
@@ -148,15 +162,78 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // --- Chunk → Node + Embedding events ---
+                // --- Chunk → Section Hierarchy + Node + Embedding events ---
                 let mut prev_chunk_id: Option<String> = None;
-                for (i, chunk) in chunks.iter().enumerate() {
-                    let chunk_id = if i == 0 {
-                        url.clone()
-                    } else {
-                        format!("{}#chunk-{}", url, i)
-                    };
+                let mut sections_created = HashSet::new();
 
+                // 1. Create Page Embedding (Broad search context)
+                let page_embedding_content = format!("Title: {}\nURL: {}\nFull Summary: This page contains {} chunks covering topics like: {}", 
+                    title, url, chunks.len(), 
+                    chunks.iter().take(3).map(|c| c.headers.last().cloned().unwrap_or("General".into())).collect::<Vec<_>>().join(", ")
+                );
+                let _ = bus_for_extraction.publish(Event::new(
+                    url,
+                    event.sequence_num + 5,
+                    AppEvent::Graph(GraphEvent::RequestEmbedding {
+                        id: url.clone(),
+                        content: page_embedding_content,
+                    }),
+                ));
+
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let chunk_id = format!("{}#chunk-{}", url, i);
+
+                    // --- Section Hierarchy Logic ---
+                    // Create intermediate nodes for the header breadcrumbs
+                    let mut parent_id = url.clone();
+                    for (depth, header) in chunk.headers.iter().enumerate() {
+                        let section_id = format!("{}#section-{}", url, chunk.headers[..=depth].join("/").replace(" ", "-"));
+                        
+                        if !sections_created.contains(&section_id) {
+                            let mut section_meta = HashMap::new();
+                            section_meta.insert("type".into(), "section".into());
+                            section_meta.insert("title".into(), header.clone());
+                            section_meta.insert("page_title".into(), title.clone());
+                            section_meta.insert("breadcrumb".into(), chunk.headers[..=depth].join(" > "));
+
+                            let _ = bus_for_extraction.publish(Event::new(
+                                &section_id,
+                                event.sequence_num + 10,
+                                AppEvent::Graph(GraphEvent::NodeCreated {
+                                    id: section_id.clone(),
+                                    metadata: section_meta,
+                                }),
+                            ));
+
+                            // Link section to its parent (Page or higher Section)
+                            let _ = bus_for_extraction.publish(Event::new(
+                                &section_id,
+                                event.sequence_num + 11,
+                                AppEvent::Graph(GraphEvent::EdgeAdded {
+                                    from: section_id.clone(),
+                                    to: parent_id.clone(),
+                                    relation: "part_of".into(),
+                                    weight: 1.2, // Stronger weight for structural links
+                                }),
+                            ));
+
+                            // Section Embedding (Medium broadness)
+                            let section_embedding_content = format!("Page: {}\nSection: {}\nTopic in depth.", title, chunk.headers[..=depth].join(" > "));
+                             let _ = bus_for_extraction.publish(Event::new(
+                                &section_id,
+                                event.sequence_num + 12,
+                                AppEvent::Graph(GraphEvent::RequestEmbedding {
+                                    id: section_id.clone(),
+                                    content: section_embedding_content,
+                                }),
+                            ));
+
+                            sections_created.insert(section_id.clone());
+                        }
+                        parent_id = section_id;
+                    }
+
+                    // --- Chunk Node ---
                     let mut metadata = HashMap::new();
                     metadata.insert("type".into(), "chunk".into());
                     metadata.insert("page_title".into(), title.clone());
@@ -170,6 +247,18 @@ async fn main() -> Result<()> {
                         AppEvent::Graph(GraphEvent::NodeCreated {
                             id: chunk_id.clone(),
                             metadata,
+                        }),
+                    ));
+
+                    // --- Linking Chunk to Section or Page ---
+                    let _ = bus_for_extraction.publish(Event::new(
+                        &chunk_id,
+                        event.sequence_num + 11 + (i * 20) as u64,
+                        AppEvent::Graph(GraphEvent::EdgeAdded {
+                            from: chunk_id.clone(),
+                            to: parent_id.clone(),
+                            relation: "part_of".into(),
+                            weight: 1.0,
                         }),
                     ));
 
@@ -203,19 +292,7 @@ async fn main() -> Result<()> {
                         }),
                     ));
 
-                    if i > 0 {
-                        let _ = bus_for_extraction.publish(Event::new(
-                            &chunk_id,
-                            event.sequence_num + 15 + (i * 20) as u64,
-                            AppEvent::Graph(GraphEvent::EdgeAdded {
-                                from: chunk_id.clone(),
-                                to: url.clone(),
-                                relation: "part_of".into(),
-                                weight: 1.0,
-                            }),
-                        ));
-                    }
-
+                    // --- Sequential context Edges ---
                     if let Some(ref prev_id) = prev_chunk_id {
                         let _ = bus_for_extraction.publish(Event::new(
                             prev_id,
@@ -281,12 +358,45 @@ async fn main() -> Result<()> {
         }),
     ))?;
 
-    // Wait for the user to decide when to finish (allowing embeddings to complete)
+    // Monitor completion
     info!("Pipeline running. The graph is being populated asynchronously.");
-    info!("Press [ENTER] to stop crawling and save the final graph state...");
+    info!("Waiting for all crawls and embeddings to complete...");
 
-    let mut input = String::new();
-    let _ = std::io::stdin().read_line(&mut input);
+    let mut last_ingested = 0;
+    let mut silence_time = 0;
+    let mut settle_time = 0;
+
+    while settle_time < 3 {
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        
+        let state = graph_state.read();
+        let total_nodes = state.nodes.len();
+        let embedded_nodes = state.nodes.values().filter(|n| n.embedding.is_some()).count();
+        let req = requested_count.load(Ordering::Relaxed);
+        let ing = ingested_count.load(Ordering::Relaxed);
+
+        if ing == last_ingested {
+            silence_time += 1;
+        } else {
+            silence_time = 0;
+            last_ingested = ing;
+        }
+
+        // We are done if: (all req are ingested OR we're silent for 15s) AND all nodes have embeddings
+        let is_done = (ing >= req || silence_time >= 15) && total_nodes > 0 && embedded_nodes == total_nodes;
+
+        if is_done {
+            settle_time += 1;
+        } else {
+            settle_time = 0;
+        }
+
+        if silence_time % 5 == 0 && silence_time > 0 && !is_done {
+             info!("... still waiting (ingested: {}/{}, nodes: {}/{})", ing, req, embedded_nodes, total_nodes);
+        }
+    }
+
+    info!("All work completed. Finalizing state...");
 
     // 8. Inspect the Result
     {
@@ -319,12 +429,23 @@ async fn main() -> Result<()> {
         }
 
         // --- Save Result for Search Demo ---
-        let output_path = "examples/outputs/graph_state.json";
-        std::fs::create_dir_all("examples/outputs")?;
+        let output_path = [
+            "graph_state.json",
+            "examples/outputs/graph_state.json",
+        ].iter().find(|&&p| std::path::Path::new(p).exists()).copied()
+        .unwrap_or("graph_state.json");
+        
+        if let Some(parent) = std::path::Path::new(&output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        
         let json = serde_json::to_string_pretty(&*state)?;
-        std::fs::write(output_path, json)?;
+        std::fs::write(&output_path, json)?;
         info!("Graph state persisted to: {}", output_path);
     }
 
-    Ok(())
+    info!("Pipeline execution complete. Exiting explicitly.");
+    std::process::exit(0);
 }

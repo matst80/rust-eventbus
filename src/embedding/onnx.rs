@@ -35,7 +35,11 @@ impl OnnxEmbeddingService {
         builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow::anyhow!("Failed to set optimization: {:?}", e))?;
 
-        let cpu_only = std::env::var("CPU_ONLY").map(|v| v == "1" || v.to_lowercase() == "true").unwrap_or(false);
+        let default_cpu_only = cfg!(all(target_arch = "aarch64", target_os = "macos"));
+        let cpu_only = match std::env::var("CPU_ONLY") {
+            Ok(v) => v == "1" || v.to_lowercase() == "true",
+            Err(_) => default_cpu_only,
+        };
 
         let session = if cpu_only {
             println!("CPU_ONLY set. Initializing ONNX on CPU.");

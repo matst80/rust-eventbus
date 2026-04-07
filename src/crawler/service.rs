@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::handler::viewport::Viewport;
+use chromiumoxide::Page;
 use futures::StreamExt;
 use std::fmt;
 use std::sync::Arc;
@@ -148,6 +149,16 @@ impl CrawlerService {
 
             tokio::spawn(async move {
                 info!("Runner #{} started", i);
+
+                // Initialize a single page for this runner to reuse
+                let page = match browser_clone.new_page("about:blank").await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!("Runner #{} failed to create initial page: {:?}", i, e);
+                        return;
+                    }
+                };
+
                 loop {
                     let event = {
                         let mut lock = rx_worker.lock().await;
@@ -170,7 +181,7 @@ impl CrawlerService {
 
                             info!("Runner #{} processing: {}", i, url);
                             match Self::process_crawl(
-                                browser_clone.clone(),
+                                &page,
                                 &url,
                                 wait_selector,
                                 max_chunks,
@@ -216,6 +227,7 @@ impl CrawlerService {
                     }
                 }
                 info!("Runner #{} stopping", i);
+                let _ = page.close().await;
             });
         }
 
@@ -246,15 +258,14 @@ impl CrawlerService {
     /// and drops the raw HTML before returning. This ensures multi-megabyte Chrome DOM strings
     /// never enter the event-bus ring buffer.
     async fn process_crawl(
-        browser: Arc<Browser>,
+        page: &Page,
         url: &str,
         wait_selector: Option<String>,
         max_chunks: usize,
     ) -> Result<(String, Vec<String>, Vec<Chunk>)> {
-        let page = browser
-            .new_page(url)
+        page.goto(url)
             .await
-            .context("Failed to open new page")?;
+            .context("Failed to navigate to URL")?;
 
         if let Some(selector) = wait_selector {
             info!("Waiting for selector: {}", selector);
@@ -273,9 +284,6 @@ impl CrawlerService {
             .await?
             .into_value::<String>()
             .context("Failed to get page title")?;
-
-        // CRITICAL: Close page to free Chrome memory before heavy processing.
-        page.close().await.context("Failed to close page")?;
 
         // Convert HTML → links + chunks in a blocking thread.
         // `content` is moved into the closure and freed after chunking — it never enters the bus.

@@ -17,7 +17,7 @@ impl Default for ChunkerOptions {
         Self {
             max_size: 1500,
             min_size: 300,
-            overlap: 200,
+            overlap: 20,
         }
     }
 }
@@ -140,17 +140,14 @@ impl MarkdownChunker {
                     headers: current_headers.clone(),
                 });
 
-                // Handle overlap
-                if options.overlap > 0 && current_content.len() > options.overlap {
-                    let overlap_start = current_content.len().saturating_sub(options.overlap);
-                    current_content = current_content[overlap_start..].to_string();
-                } else {
-                    current_content.clear();
-                }
+                // Handle overlap: skip if it's a clean paragraph break (blank line)
+                // The user requested no overlap on blank lines. Paragraphs are separated by blank lines.
+                current_content.clear();
             }
 
+            current_headers = headers;
             if current_content.is_empty() {
-                current_headers = headers;
+                // First atom
             } else {
                 current_content.push_str("\n\n");
             }
@@ -158,20 +155,43 @@ impl MarkdownChunker {
 
             // If a single atom is STILL too large, split it by characters
             while current_content.len() > options.max_size {
-                let split_idx = current_content
-                    .char_indices()
-                    .map(|(i, _)| i)
-                    .filter(|&i| i <= options.max_size)
-                    .last()
-                    .unwrap_or(options.max_size);
+                let split_search_len = options.max_size.min(current_content.len());
+                let mut is_blank_line = false;
+                let split_idx = if let Some(idx) = current_content[..split_search_len].rfind("\n\n") {
+                    is_blank_line = true;
+                    idx
+                } else if let Some(idx) = current_content[..split_search_len].rfind('\n') {
+                    idx
+                } else if let Some(idx) = current_content[..split_search_len].rfind(' ') {
+                    idx
+                } else {
+                    current_content
+                        .char_indices()
+                        .map(|(i, _)| i)
+                        .filter(|&i| i <= options.max_size)
+                        .last()
+                        .unwrap_or(options.max_size)
+                };
+
+                let split_idx = if split_idx == 0 {
+                    split_search_len
+                } else {
+                    split_idx
+                };
 
                 chunks.push(Chunk {
                     content: current_content[..split_idx].trim().to_string(),
                     headers: current_headers.clone(),
                 });
 
-                let overlap_start = split_idx.saturating_sub(options.overlap);
-                current_content = current_content[overlap_start..].to_string();
+                let overlap = if is_blank_line { 0 } else { options.overlap };
+                let overlap_start = split_idx.saturating_sub(overlap);
+                let boundary = current_content
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .find(|&i| i >= overlap_start)
+                    .unwrap_or(current_content.len());
+                current_content = current_content[boundary..].to_string();
             }
         }
 
@@ -269,5 +289,52 @@ Content of section 1
         let chunks = MarkdownChunker::chunk(markdown, &options);
 
         assert!(chunks.len() > 1);
+    }
+
+    #[test]
+    fn test_chunk_preference() {
+        let options = ChunkerOptions {
+            max_size: 40,
+            min_size: 10,
+            overlap: 0,
+        };
+
+        // Case 1: Preference for \n\n
+        let markdown = "Paragraph 1 that is quite long indeed.\n\nParagraph 2 that is also long.";
+        let chunks = MarkdownChunker::chunk(markdown, &options);
+        assert!(chunks[0].content.contains("Paragraph 1"));
+        assert!(!chunks[0].content.contains("Paragraph 2"));
+
+        // Case 2: Preference for \n
+        let markdown = "Line 1 is long enough to fit.\nLine 2 is also here.";
+        let chunks = MarkdownChunker::chunk(markdown, &options);
+        assert_eq!(chunks[0].content, "Line 1 is long enough to fit.");
+
+        // Case 3: Preference for space
+        let markdown = "This is a sentence that will be split at a space.";
+        let chunks = MarkdownChunker::chunk(markdown, &options);
+        assert_eq!(chunks[0].content, "This is a sentence that will be split");
+    }
+
+    #[test]
+    fn test_chunk_overlap_skip() {
+        let options = ChunkerOptions {
+            max_size: 40,
+            min_size: 10,
+            overlap: 10,
+        };
+
+        // Blank line split -> No overlap
+        let markdown = "Paragraph 1 that is longish.\n\nParagraph 2 that is also long.";
+        let chunks = MarkdownChunker::chunk(markdown, &options);
+        assert_eq!(chunks[0].content, "Paragraph 1 that is longish.");
+        // Next chunk should NOT contain "longish" if overlap was skipped.
+        assert!(!chunks[1].content.contains("longish"));
+
+        // Single newline split -> Overlap
+        let markdown = "Line 1 is quite long and stuff.\nLine 2 is here.";
+        let chunks = MarkdownChunker::chunk(markdown, &options);
+        // Overlap should be "and stuff." (10 chars roughly)
+        assert!(chunks[1].content.contains("and stuff."));
     }
 }

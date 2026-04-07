@@ -20,9 +20,9 @@ async fn main() -> Result<()> {
     // 1. Create an EventBus for AppEvents
     let bus = Arc::new(EventBus::<AppEvent>::new(100));
 
-    // 2. Initialize the CrawlerService with headless=false and 2 runners
+    // 2. Initialize the CrawlerService with headless=false and 1 runner to verify window reuse
     let config = CrawlerConfig {
-        concurrency: 2,
+        concurrency: 1,
         headless: false,
         ..Default::default()
     };
@@ -57,11 +57,13 @@ async fn main() -> Result<()> {
     // Wait for the service to be ready
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-    // 5. Trigger multiple crawls to demonstrate queueing (since concurrency is 2)
+    // 5. Trigger multiple crawls to demonstrate window reuse
     let urls = vec![
-        "https://www.elgiganten.se",
         "https://www.google.se",
         "https://www.github.com",
+        "https://www.rust-lang.org",
+        "https://www.wikipedia.org",
+        "https://www.bing.com",
     ];
 
     for (i, url) in urls.into_iter().enumerate() {
@@ -71,7 +73,7 @@ async fn main() -> Result<()> {
             1,
             AppEvent::Crawler(CrawlerEvent::CrawlRequested { 
                 url: url.to_string(),
-                wait_selector: if url.contains("elgiganten") { Some("main[id='main-content']".into()) } else { None },
+                wait_selector: None,
             }),
         );
         bus.publish(crawl_request)?;
