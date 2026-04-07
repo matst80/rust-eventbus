@@ -1,6 +1,7 @@
 use anyhow::Result;
 use rust_eventbus::{Event, EventBus};
 use rust_eventbus::crawler::{CrawlerConfig, CrawlerEvent, CrawlerService};
+use rust_eventbus::app_event::AppEvent;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -16,8 +17,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // 1. Create an EventBus for CrawlerEvents
-    let bus = Arc::new(EventBus::<CrawlerEvent>::new(100));
+    // 1. Create an EventBus for AppEvents
+    let bus = Arc::new(EventBus::<AppEvent>::new(100));
 
     // 2. Initialize the CrawlerService with headless=false and 2 runners
     let config = CrawlerConfig {
@@ -38,13 +39,13 @@ async fn main() -> Result<()> {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
-            match event.payload {
-                CrawlerEvent::PageIngested { url, title, content } => {
+            match &event.payload {
+                AppEvent::Crawler(CrawlerEvent::PageIngested { url, title, chunks, .. }) => {
                     info!("--- CRAWL SUCCESS: {} ---", title);
                     info!("URL: {}", url);
-                    info!("Content length: {}", content.len());
+                    info!("Chunks: {}", chunks.len());
                 }
-                CrawlerEvent::CrawlFailed { url, error } => {
+                AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, error }) => {
                     info!("--- CRAWL FAILED: {} ---", url);
                     info!("Error: {}", error);
                 }
@@ -68,10 +69,10 @@ async fn main() -> Result<()> {
         let crawl_request = Event::new(
             format!("crawler-demo-{}", i),
             1,
-            CrawlerEvent::CrawlRequested { 
+            AppEvent::Crawler(CrawlerEvent::CrawlRequested { 
                 url: url.to_string(),
                 wait_selector: if url.contains("elgiganten") { Some("main[id='main-content']".into()) } else { None },
-            },
+            }),
         );
         bus.publish(crawl_request)?;
     }

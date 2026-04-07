@@ -12,6 +12,7 @@ use rust_eventbus::{
     store::{FileEventStore, EventStore},
     distributed::{DistributedPubSub, DistributedError},
     projection::Projection,
+    app_event::AppEvent,
 };
 use async_trait::async_trait;
 
@@ -58,8 +59,8 @@ async fn test_onnx_embedding_flow() -> anyhow::Result<()> {
     let service = Arc::new(OnnxEmbeddingService::new(model_path, tokenizer_path)?);
     
     // 4. Setup Event Bus and Mesh
-    let bus = EventBus::<EmbeddingEvent>::new(100);
-    let mesh = Arc::new(MockPubSub::<EmbeddingEvent>::new());
+    let bus = EventBus::<AppEvent>::new(100);
+    let mesh = Arc::new(MockPubSub::<AppEvent>::new());
     let event_store = Arc::new(FileEventStore::new(&store_path).await?);
 
     // 5. Setup Actor
@@ -88,7 +89,7 @@ async fn test_onnx_embedding_flow() -> anyhow::Result<()> {
     // 7. Publish a TextChunkCreated event
     let id = "test-doc-1".to_string();
     let text = "This is a test chunk of text for embedding extraction.".to_string();
-    let event = Event::new(&id, 1, EmbeddingEvent::TextChunkCreated { id: id.clone(), text });
+    let event = Event::new(&id, 1, AppEvent::Embedding(EmbeddingEvent::TextChunkCreated { id: id.clone(), text }));
     
     let stored = event_store.append(vec![event]).await?;
     for e in stored {

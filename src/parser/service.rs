@@ -1,14 +1,12 @@
-use anyhow::{Result};
+use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, debug};
-use scraper::Html;
 
 use crate::bus::EventBus;
 use crate::event::Event;
 use crate::crawler::event::CrawlerEvent;
 use super::event::ParserEvent;
-use super::extractor::Extractor;
 
 pub struct ParserService {
     bus: Arc<EventBus<CrawlerEvent>>,
@@ -39,17 +37,15 @@ impl ParserService {
         
         tokio::spawn(async move {
             while let Some(event) = rx_internal.recv().await {
-                if let CrawlerEvent::PageIngested { url, content, title } = event.payload {
-                    debug!("Parsing: {}", url);
-                    
-                    let html = Html::parse_document(&content);
-                    let links = Extractor::extract_links(&html, &url);
-                    let structured_data = Extractor::extract_structured_data(&html);
-                    let metadata = Extractor::extract_metadata(&html);
-                    
-                    let exclude_refs: Vec<&str> = extra_excludes.iter().map(|s| s.as_str()).collect();
-                    let markdown = Extractor::to_markdown(&content, &url, &exclude_refs);
-
+                if let CrawlerEvent::PageIngested { url, title, links, chunks } = event.payload {
+                    debug!("Parsing: {} ({} chunks)", url, chunks.len());
+                    // HTML was already converted to chunks in the crawler.
+                    // Reassemble markdown from chunks for consumers that need it.
+                    let markdown = chunks.iter()
+                        .map(|c| c.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let _ = extra_excludes; // no longer used — HTML is gone
                     let result_event = Event::new(
                         event.aggregate_id.clone(),
                         event.sequence_num + 1,
@@ -58,11 +54,10 @@ impl ParserService {
                             title,
                             markdown,
                             links,
-                            structured_data,
-                            metadata,
+                            structured_data: vec![],   // not available without raw HTML
+                            metadata: std::collections::HashMap::new(),
                         },
                     );
-
                     let _ = parser_bus_clone.publish(result_event);
                 }
             }

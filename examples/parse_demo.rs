@@ -60,15 +60,19 @@ fn main() -> Result<()> {
 
         // 3. Save Markdown to file
         println!("  - saving markdown to: {:?}", output_path);
-        let mut final_markdown = format!("# {}\n\n", title);
-        final_markdown.push_str(&format!("Source: {}\n\n", url));
-        final_markdown.push_str("## Metadata\n\n");
-        for (k, v) in &metadata {
-            if !v.trim().is_empty() {
-                final_markdown.push_str(&format!("- **{}**: {}\n", k, v.trim()));
+        let mut final_markdown = format!("**Title**: {}\n", title);
+        final_markdown.push_str(&format!("**Source**: {}\n\n", url));
+        
+        if !metadata.is_empty() {
+            for (k, v) in &metadata {
+                if !v.trim().is_empty() {
+                    final_markdown.push_str(&format!("- **{}**: {}\n", k, v.trim()));
+                }
             }
+            final_markdown.push_str("\n");
         }
-        final_markdown.push_str("\n---\n\n");
+        
+        final_markdown.push_str("---\n\n");
         final_markdown.push_str(&markdown);
 
         fs::write(&output_path, final_markdown)?;

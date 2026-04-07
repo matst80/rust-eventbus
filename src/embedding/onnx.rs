@@ -16,8 +16,18 @@ pub struct OnnxEmbeddingService {
 
 impl OnnxEmbeddingService {
     pub fn new<P: AsRef<Path>>(model_path: P, tokenizer_path: P) -> Result<Self> {
-        let tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
+        let mut tokenizer = Tokenizer::from_file(tokenizer_path.as_ref())
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+
+        // Configure padding and truncation to ensure consistent batch shapes
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::Fixed(512),
+            ..Default::default()
+        }));
+        tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 512,
+            ..Default::default()
+        })).map_err(|e| anyhow::anyhow!("Failed to set truncation: {}", e))?;
 
         let mut builder = Session::builder()
             .map_err(|e| anyhow::anyhow!("Failed to create builder: {:?}", e))?;
@@ -71,19 +81,19 @@ impl OnnxEmbeddingService {
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let results = self.embed_batch(&vec![text.to_string()])?;
+        let results = self.embed_batch(vec![text.to_string()])?;
         Ok(results.into_iter().next().unwrap())
     }
 
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
 
-        let encodings = self.tokenizer.encode_batch(texts.to_vec(), true)
+        let batch_size = texts.len();
+        let encodings = self.tokenizer.encode_batch(texts, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
-        let batch_size = texts.len();
         let seq_len = encodings[0].len();
         
         // Prepare input tensors

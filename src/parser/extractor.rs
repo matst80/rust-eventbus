@@ -50,6 +50,25 @@ impl Extractor {
         data
     }
 
+    fn normalize_meta_name(name: &str) -> String {
+        let n = name.to_lowercase();
+        n.replace("og:", "").replace("twitter:", "").replace("itemprop:", "").replace("article:", "")
+    }
+
+    fn is_excluded_meta(element: &scraper::ElementRef) -> bool {
+        let name = element.value().attr("name")
+            .or_else(|| element.value().attr("property"))
+            .or_else(|| element.value().attr("itemprop"));
+        
+        match name {
+            Some(n) => {
+                let n = Self::normalize_meta_name(n);
+                ["robots", "viewport", "theme-color", "image", "type", "card", "label1", "data1", "site_name", "url", "msapplication-tileimage", "locale"].contains(&n.as_str())
+            }
+            None => true,
+        }
+    }
+
     /// Extracts metadata (Meta tags, OpenGraph).
     /// If there are multiple values for the same key, keeps the longest one.
     pub fn extract_metadata(html: &Html) -> HashMap<String, String> {
@@ -57,6 +76,9 @@ impl Extractor {
         let selector = Selector::parse("meta").expect("Valid selector");
 
         for element in html.select(&selector) {
+            if Self::is_excluded_meta(&element) {
+                continue;
+            }
             let name = element.value().attr("name")
                 .or_else(|| element.value().attr("property"))
                 .or_else(|| element.value().attr("itemprop"));
@@ -64,7 +86,8 @@ impl Extractor {
             let content = element.value().attr("content");
 
             if let (Some(n), Some(c)) = (name, content) {
-                let n = n.to_lowercase();
+                let n = Self::normalize_meta_name(n);
+                
                 let existing = metadata.entry(n).or_insert_with(|| c.to_string());
                 if c.len() > existing.len() {
                     *existing = c.to_string();
@@ -229,16 +252,18 @@ mod tests {
                 <head>
                     <meta name="description" content="Short desc">
                     <meta name="description" content="This is a much longer description that should be kept.">
+                    <meta name="og:description" content="Vår kundtjänst finns här för att hjälpa dig! Titta gärna igenom vanliga frågor innan du kontaktar oss, för att se om vi redan svarat på din fråga.">
+                    
                     <meta property="og:title" content="Long title">
-                    <meta property="og:title" content="Short">
+                    <meta property="title" content="Short">
                 </head>
             </html>
         "#;
         let html = Html::parse_document(html_content);
         let meta = Extractor::extract_metadata(&html);
         
-        assert_eq!(meta.get("description").unwrap(), "This is a much longer description that should be kept.");
-        assert_eq!(meta.get("og:title").unwrap(), "Long title");
+        assert_eq!(meta.get("description").unwrap(), "Vår kundtjänst finns här för att hjälpa dig! Titta gärna igenom vanliga frågor innan du kontaktar oss, för att se om vi redan svarat på din fråga.");
+        assert_eq!(meta.get("title").unwrap(), "Long title");
     }
 
     #[test]

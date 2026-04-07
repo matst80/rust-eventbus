@@ -6,8 +6,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::bus::{EventBus};
-use crate::event::{Event};
+use crate::bus::EventBus;
+use crate::event::Event;
+use crate::app_event::AppEvent;
+use crate::parser::{Chunk, ChunkerOptions, Extractor, MarkdownChunker};
 use super::event::CrawlerEvent;
 
 /// Configuration for the CrawlerService.
@@ -33,13 +35,13 @@ impl Default for CrawlerConfig {
 
 /// A service that performs web crawling using a headless browser.
 pub struct CrawlerService {
-    bus: Arc<EventBus<CrawlerEvent>>,
+    bus: Arc<EventBus<AppEvent>>,
     config: CrawlerConfig,
 }
 
 impl CrawlerService {
     /// Creates a new `CrawlerService` with the specified configuration.
-    pub fn new(bus: Arc<EventBus<CrawlerEvent>>, config: CrawlerConfig) -> Self {
+    pub fn new(bus: Arc<EventBus<AppEvent>>, config: CrawlerConfig) -> Self {
         Self { bus, config }
     }
 
@@ -109,7 +111,7 @@ impl CrawlerService {
         });
 
         // --- Internal Task Queue ---
-        let (tx, rx_internal) = mpsc::channel::<Event<CrawlerEvent>>(100);
+        let (tx, rx_internal) = mpsc::channel::<Event<AppEvent>>(100);
         let shared_rx = Arc::new(tokio::sync::Mutex::new(rx_internal));
 
         // Spawn Runner Workers
@@ -127,15 +129,17 @@ impl CrawlerService {
                     };
 
                     if let Some(event) = event {
-                        if let CrawlerEvent::CrawlRequested { url, wait_selector } = event.payload {
+                        if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, wait_selector }) = &event.payload {
+                            let url = url.clone();
+                            let wait_selector = wait_selector.clone();
                             info!("Runner #{} processing: {}", i, url);
                             match Self::process_crawl(browser_clone.clone(), &url, wait_selector).await {
-                                Ok((content, title)) => {
-                                    info!("Runner #{} successfully crawled: {}", i, url);
+                                Ok((title, links, chunks)) => {
+                                    info!("Runner #{} crawled: {} ({} links, {} chunks)", i, url, links.len(), chunks.len());
                                     let result_event = Event::new(
                                         event.aggregate_id.clone(),
                                         event.sequence_num + 1,
-                                        CrawlerEvent::PageIngested { url, content, title },
+                                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, title, links, chunks }),
                                     );
                                     let _ = bus_clone.publish(result_event);
                                 }
@@ -144,7 +148,7 @@ impl CrawlerService {
                                     let error_event = Event::new(
                                         event.aggregate_id.clone(),
                                         event.sequence_num + 1,
-                                        CrawlerEvent::CrawlFailed { url, error: e.to_string() },
+                                        AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, error: e.to_string() }),
                                     );
                                     let _ = bus_clone.publish(error_event);
                                 }
@@ -163,7 +167,7 @@ impl CrawlerService {
         loop {
             tokio::select! {
                 Ok(event) = rx.recv() => {
-                    if let CrawlerEvent::CrawlRequested { .. } = &event.payload {
+                    if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { .. }) = &event.payload {
                         // Queue the task
                         if let Err(e) = tx.send(event).await {
                             error!("Failed to queue crawl task: {:?}", e);
@@ -181,10 +185,12 @@ impl CrawlerService {
         Ok(())
     }
 
-    async fn process_crawl(browser: Arc<Browser>, url: &str, wait_selector: Option<String>) -> Result<(String, String)> {
+    /// Fetches the page, immediately converts the HTML to links + chunks in a blocking thread,
+    /// and drops the raw HTML before returning. This ensures multi-megabyte Chrome DOM strings
+    /// never enter the event-bus ring buffer.
+    async fn process_crawl(browser: Arc<Browser>, url: &str, wait_selector: Option<String>) -> Result<(String, Vec<String>, Vec<Chunk>)> {
         let page = browser.new_page(url).await.context("Failed to open new page")?;
 
-        // Handle SPAs: if a selector is provided, wait for it.
         if let Some(selector) = wait_selector {
             info!("Waiting for selector: {}", selector);
             page.find_element(&selector)
@@ -200,9 +206,26 @@ impl CrawlerService {
             .into_value::<String>()
             .context("Failed to get page title")?;
 
-        // CRITICAL: Close page to free memory
+        // CRITICAL: Close page to free Chrome memory before heavy processing.
         page.close().await.context("Failed to close page")?;
 
-        Ok((content, title))
+        // Convert HTML → links + chunks in a blocking thread.
+        // `content` is moved into the closure and freed after chunking — it never enters the bus.
+        let url_owned = url.to_string();
+        let (links, chunks) = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
+            let html = scraper::Html::parse_document(&content);
+            let links = Extractor::extract_links(&html, &url_owned);
+            drop(html); // free DOM #1 before markdown conversion
+
+            let markdown = Extractor::to_markdown(&content, &url_owned, &[]);
+            drop(content); // free the raw HTML string — it's no longer needed
+
+            let chunks = MarkdownChunker::chunk(&markdown, &ChunkerOptions { max_size: 1000, ..Default::default() });
+            Ok((links, chunks))
+        })
+        .await
+        .context("Blocking extraction task panicked")??;
+
+        Ok((title, links, chunks))
     }
 }

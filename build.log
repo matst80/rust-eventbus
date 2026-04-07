@@ -1,0 +1,94 @@
+    Checking rust-eventbus v0.1.0 (/Users/mats/github.com/matst80/rust-eventbus)
+warning: unused imports: `Edge` and `Node`
+ --> examples/search_tui.rs:8:25
+  |
+8 |     graph::{GraphState, Node, Edge},
+  |                         ^^^^  ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0599]: the method `cursor` exists for reference `&bubbletea_widgets::List<T>`, but its trait bounds were not satisfied
+  --> examples/search_tui.rs:80:23
+   |
+80 |         if index == m.cursor() {
+   |                       ^^^^^^ private field, not a method
+   |
+   = note: the following trait bounds were not satisfied:
+           `T: Send`
+           `T: Sync`
+
+error[E0599]: no method named `select` found for struct `bubbletea_widgets::List<I>` in the current scope
+   --> examples/search_tui.rs:186:27
+    |
+186 | ...lts_list.select(0);
+    |             ^^^^^^ method not found in `List<...>`
+    |
+    = note: the full name for the type has been written to '/Users/mats/github.com/matst80/rust-eventbus/target/debug/examples/search_tui-f49e93df8928f80d.long-type-5972240727614700866.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: no method named `select` found for struct `bubbletea_widgets::List<I>` in the current scope
+   --> examples/search_tui.rs:206:29
+    |
+206 | ...ons_list.select(0);
+    |             ^^^^^^ method not found in `List<RelationItem>`
+    |
+    = note: the full name for the type has been written to '/Users/mats/github.com/matst80/rust-eventbus/target/debug/examples/search_tui-f49e93df8928f80d.long-type-15117390014076688934.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: the method `clone` exists for struct `Box<dyn Any + Send>`, but its trait bounds were not satisfied
+   --> examples/search_tui.rs:250:70
+    |
+250 |   ...date(msg.clone());
+    |               ^^^^^ method cannot be called on `Box<dyn Any + Send>` due to unsatisfied trait bounds
+    |
+   ::: /Users/mats/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/boxed.rs:234:1
+    |
+234 | / pub struct Box<
+235 | |     T: ?Sized,
+236 | |     #[unstable(feature = "allo...
+237 | | >(Unique<T>, A);
+    | |_- doesn't satisfy `Box<dyn Any + Send>: Clone`
+    |
+   ::: /Users/mats/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/any.rs:113:1
+    |
+113 |   pub trait Any: 'static {
+    |   ---------------------- doesn't satisfy `dyn Any + Send: Clone` or `dyn Any + Send: Sized`
+    |
+    = note: the following trait bounds were not satisfied:
+            `dyn Any + Send: Sized`
+            which is required by `Box<dyn Any + Send>: Clone`
+            `dyn Any + Send: Clone`
+            which is required by `Box<dyn Any + Send>: Clone`
+    = note: the full name for the type has been written to '/Users/mats/github.com/matst80/rust-eventbus/target/debug/examples/search_tui-f49e93df8928f80d.long-type-6487750343733846022.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+error[E0599]: the method `clone` exists for struct `Box<dyn Any + Send>`, but its trait bounds were not satisfied
+   --> examples/search_tui.rs:272:74
+    |
+272 |   ...date(msg.clone());
+    |               ^^^^^ method cannot be called on `Box<dyn Any + Send>` due to unsatisfied trait bounds
+    |
+   ::: /Users/mats/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/alloc/src/boxed.rs:234:1
+    |
+234 | / pub struct Box<
+235 | |     T: ?Sized,
+236 | |     #[unstable(feature = "allo...
+237 | | >(Unique<T>, A);
+    | |_- doesn't satisfy `Box<dyn Any + Send>: Clone`
+    |
+   ::: /Users/mats/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/any.rs:113:1
+    |
+113 |   pub trait Any: 'static {
+    |   ---------------------- doesn't satisfy `dyn Any + Send: Clone` or `dyn Any + Send: Sized`
+    |
+    = note: the following trait bounds were not satisfied:
+            `dyn Any + Send: Sized`
+            which is required by `Box<dyn Any + Send>: Clone`
+            `dyn Any + Send: Clone`
+            which is required by `Box<dyn Any + Send>: Clone`
+    = note: the full name for the type has been written to '/Users/mats/github.com/matst80/rust-eventbus/target/debug/examples/search_tui-f49e93df8928f80d.long-type-6487750343733846022.txt'
+    = note: consider using `--verbose` to print the full type name to the console
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `rust-eventbus` (example "search_tui") generated 1 warning
+error: could not compile `rust-eventbus` (example "search_tui") due to 5 previous errors; 1 warning emitted

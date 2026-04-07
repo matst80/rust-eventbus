@@ -13,6 +13,8 @@ pub mod task_limiter;
 pub mod embedding;
 pub mod crawler;
 pub mod parser;
+pub mod app_event;
+pub mod graph;
 
 pub use bus::{EventBus, SubscriberId};
 pub use event::{Event, EventPayload};
