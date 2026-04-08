@@ -278,18 +278,75 @@ impl CrawlerService {
                 .await
                 .context(format!("Failed to find selector: {}", selector))?;
         } else {
-            page.wait_for_navigation()
-                .await
-                .context("Wait for navigation failed")?;
+            // Navigation to non-HTML (like PDFs) sometimes doesn't trigger 'load' event.
+            // We use a short timeout to handle cases where Chrome's PDF viewer is slow to settle.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                page.wait_for_navigation()
+            ).await;
         }
 
-        let content = page.content().await.context("Failed to get page content")?;
+        let content_type = page
+            .evaluate("document.contentType")
+            .await?
+            .into_value::<String>()
+            .unwrap_or_default();
+
+        let is_pdf = url.to_lowercase().ends_with(".pdf") || content_type == "application/pdf";
+
         let title = page
             .evaluate("document.title")
             .await?
             .into_value::<String>()
-            .context("Failed to get page title")?;
+            .unwrap_or_else(|_| url.split('/').last().unwrap_or("PDF Document").to_string());
 
+        if is_pdf {
+            info!("PDF detected: {}. Extracting text...", url);
+            // Fetch bytes via JS to reuse any browser-level session/cookies.
+            // We use a blob → arrayBuffer → base64 conversion.
+            let b64_script = r#"
+                (async () => {
+                    const resp = await fetch(window.location.href);
+                    const buf = await resp.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+                    let binary = '';
+                    for (let i = 0; i < bytes.byteLength; i++) {
+                        binary += String.fromCharCode(bytes[i]);
+                    }
+                    return btoa(binary);
+                })()
+            "#;
+            
+            let b64: String = page.evaluate(b64_script).await?
+                .into_value::<String>()
+                .context("Failed to fetch PDF bytes via JS")?;
+            
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.replace(['\n', '\r'], ""))
+                .context("Failed to decode base64 PDF data")?;
+
+            let (links, chunks) = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
+                let text = Extractor::extract_pdf_text(&bytes)?;
+                let mut chunks = MarkdownChunker::chunk(
+                    &text,
+                    &ChunkerOptions {
+                        max_size: 1000,
+                        ..Default::default()
+                    },
+                );
+                if chunks.len() > max_chunks {
+                    chunks.truncate(max_chunks);
+                }
+                // PDF link extraction could be added here later if needed
+                Ok((Vec::new(), chunks))
+            }).await.context("Blocking PDF extraction task panicked")??;
+
+            return Ok((title, links, chunks));
+        }
+
+        let content = page.content().await.context("Failed to get page content")?;
+        
         // Convert HTML → links + chunks in a blocking thread.
         // `content` is moved into the closure and freed after chunking — it never enters the bus.
         let url_owned = url.to_string();

@@ -1,11 +1,23 @@
+use lopdf::Document;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::collections::HashMap;
 use url::Url;
+use anyhow::{Result, Context};
 
 pub struct Extractor;
 
 impl Extractor {
+    /// Extracts text from a PDF document.
+    pub fn extract_pdf_text(data: &[u8]) -> Result<String> {
+        let doc = Document::load_mem(data).context("Failed to load PDF from memory")?;
+        let pages = doc.get_pages();
+        let mut page_numbers: Vec<u32> = pages.keys().cloned().collect();
+        page_numbers.sort_unstable();
+        
+        doc.extract_text(&page_numbers).context("Failed to extract text from PDF")
+    }
+
     /// Extracts absolute links from the HTML content.
     pub fn extract_links(html: &Html, base_url: &str) -> Vec<String> {
         let Ok(base) = Url::parse(base_url) else {
