@@ -1,93 +1,88 @@
-import React, { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { 
-  CheckCircle2, 
-  Circle, 
-  Trash2, 
-  Plus, 
-  Search,
-  Filter,
-  Check,
-  ChevronDown,
-  Info,
-  ExternalLink
-} from 'lucide-react';
-
-const fetchTodos = async () => {
-  const response = await fetch('/api/todos');
-  if (!response.ok) throw new Error('Failed to fetch todos');
-  return response.json();
-};
+import React, { useState, useEffect } from 'react';
+import { useMutation } from '@tanstack/react-query';
+import { Search, Save, Globe, Info } from 'lucide-react';
 
 function App() {
-  const queryClient = useQueryClient();
-  const [newTodo, setNewTodo] = useState('');
+  const [crawlUrl, setCrawlUrl] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [logs, setLogs] = useState([]);
+  const [isCrawling, setIsCrawling] = useState(false);
 
-  const { data: todos = [], isLoading, error } = useQuery({
-    queryKey: ['todos'],
-    queryFn: fetchTodos,
+  const crawlMutation = useMutation({
+    mutationFn: async (url) => {
+      setIsCrawling(true);
+      setLogs([]); // clear old logs
+      const eventSource = new EventSource(`/api/crawl?url=${encodeURIComponent(url)}`);
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.Graph && data.Graph.NodeCreated) {
+            setLogs(prev => [...prev, `Created node: ${data.Graph.NodeCreated.id}`]);
+          } else if (data.Graph && data.Graph.EdgeAdded) {
+            setLogs(prev => [...prev, `Added edge: ${data.Graph.EdgeAdded.from} -> ${data.Graph.EdgeAdded.to}`]);
+          } else if (data.Embedding && data.Embedding.EmbeddingExtracted) {
+             setLogs(prev => [...prev, `Extracted embedding for: ${data.Embedding.EmbeddingExtracted.id}`]);
+          }
+        } catch (e) {
+          console.error("Error parsing SSE data", e);
+        }
+      };
+
+      eventSource.onerror = (error) => {
+        console.error("EventSource failed:", error);
+        eventSource.close();
+        setIsCrawling(false);
+        setLogs(prev => [...prev, `[System] Crawl finished or disconnected.`]);
+      };
+
+      // we just return a promise that resolves when it's done for the mutation state
+      return new Promise((resolve) => {
+          const checkDone = setInterval(() => {
+              if(!isCrawling && eventSource.readyState === EventSource.CLOSED) {
+                  clearInterval(checkDone);
+                  resolve();
+              }
+          }, 500);
+      })
+    },
   });
 
-  const addMutation = useMutation({
-    mutationFn: async (title) => {
-      const response = await fetch('/api/todos', {
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      const response = await fetch('/api/save', { method: 'POST' });
+      if (!response.ok) throw new Error('Failed to save graph');
+      return response.text();
+    },
+    onSuccess: (data) => alert(data),
+    onError: (error) => alert(error.message),
+  });
+
+  const searchMutation = useMutation({
+    mutationFn: async (query) => {
+      const response = await fetch('/api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({ query }),
       });
-      if (!response.ok) throw new Error('Failed to add todo');
+      if (!response.ok) throw new Error('Failed to perform search');
       return response.json();
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['todos'] });
-      setNewTodo('');
-    },
+    onSuccess: (data) => setSearchResults(data),
   });
 
-  const toggleMutation = useMutation({
-    mutationFn: async (id) => {
-      const response = await fetch(`/api/todos/${id}/complete`, {
-        method: 'PUT',
-      });
-      if (!response.ok) throw new Error('Failed to complete todo');
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['todos'] });
-    },
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: async (id) => {
-      const response = await fetch(`/api/todos/${id}`, {
-        method: 'DELETE',
-      });
-      if (!response.ok) throw new Error('Failed to delete todo');
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['todos'] });
-    },
-  });
-
-  const clearAllMutation = useMutation({
-    mutationFn: async () => {
-      const response = await fetch('/api/todos/clear', {
-        method: 'DELETE',
-      });
-      if (!response.ok) throw new Error('Failed to clear todos');
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['todos'] });
-    },
-  });
-
-  const handleAddTodo = (e) => {
+  const handleCrawl = (e) => {
     e.preventDefault();
-    if (!newTodo.trim()) return;
-    addMutation.mutate(newTodo);
+    if (!crawlUrl.trim()) return;
+    crawlMutation.mutate(crawlUrl);
   };
 
-  const openTodos = todos.filter(t => !t.completed);
-  const completedTodos = todos.filter(t => t.completed);
+  const handleSearch = (e) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    searchMutation.mutate(searchQuery);
+  };
 
   return (
     <div className="min-h-screen bg-github-canvas text-github-textMain font-sans pb-12">
@@ -95,150 +90,131 @@ function App() {
       <header className="bg-github-header border-b border-github-border px-8 py-4 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <div className="w-8 h-8 rounded-full bg-[#30363d] flex items-center justify-center">
-            <Check className="text-github-textMain w-5 h-5" />
+            <Globe className="text-github-textMain w-5 h-5" />
           </div>
-          <h1 className="text-xl font-semibold">EventBus Todos</h1>
+          <h1 className="text-xl font-semibold">Knowledge Graph Navigator</h1>
         </div>
         <div className="flex items-center gap-6 text-github-textSecondary text-sm">
           <button 
-            onClick={() => {
-              if (window.confirm('Delete all todos and start over?')) {
-                clearAllMutation.mutate();
-              }
-            }}
-            disabled={clearAllMutation.isPending}
-            className="text-red-400 hover:text-red-300 font-medium flex items-center gap-1 transition-colors disabled:opacity-50"
+            onClick={() => saveMutation.mutate()}
+            disabled={saveMutation.isPending}
+            className="text-github-accent hover:text-blue-400 font-medium flex items-center gap-1 transition-colors disabled:opacity-50"
           >
-            <Trash2 size={16} /> Clear All
+            <Save size={16} /> {saveMutation.isPending ? 'Saving...' : 'Save Graph'}
           </button>
-          <span>v1.0.0</span>
-          <a href="https://todo.k6n.net" target="_blank" rel="noreferrer" className="hover:text-github-accent flex items-center gap-1">
-            API <ExternalLink size={14} />
-          </a>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto mt-10 px-4">
-        {/* Input Section */}
-        <form onSubmit={handleAddTodo} className="mb-8 flex gap-2">
-          <input
-            type="text"
-            value={newTodo}
-            onChange={(e) => setNewTodo(e.target.value)}
-            placeholder="What needs to be done?"
-            className="flex-1 bg-github-bg border border-github-border rounded-md px-4 py-2 focus:border-github-accent focus:ring-1 focus:ring-github-accent outline-none transition-all placeholder:text-github-textSecondary"
-          />
-          <button
-            type="submit"
-            disabled={addMutation.isPending || !newTodo.trim()}
-            className="bg-github-success hover:bg-opacity-90 text-white font-medium px-4 py-2 rounded-md flex items-center gap-2 transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {addMutation.isPending ? (
-              <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-            ) : (
-              <Plus size={18} />
-            )}
-            New Todo
-          </button>
-        </form>
+      <main className="max-w-6xl mx-auto mt-10 px-4 grid grid-cols-1 md:grid-cols-2 gap-8">
 
-        {error && (
-          <div className="bg-red-900/20 border border-red-500/50 text-red-200 px-4 py-3 rounded-md mb-6 flex items-center gap-3">
-            <Info size={18} />
-            <p>{error.message}</p>
-          </div>
-        )}
-
-        {/* Issues List Container */}
-        <div className="border border-github-border rounded-md bg-github-bg overflow-hidden shadow-sm">
-          {/* Header */}
-          <div className="bg-github-header border-b border-github-border p-4 flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <button 
-                className={`flex items-center gap-1 text-sm font-semibold hover:text-github-textMain transition-colors ${openTodos.length > 0 ? 'text-github-textMain' : 'text-github-textSecondary'}`}
+        {/* Left Column: Ingestion */}
+        <div className="flex flex-col gap-6">
+          <div className="border border-github-border rounded-md bg-github-bg p-6 shadow-sm">
+            <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+              <Globe size={20} /> Ingest URL
+            </h2>
+            <form onSubmit={handleCrawl} className="flex gap-2">
+              <input
+                type="url"
+                value={crawlUrl}
+                onChange={(e) => setCrawlUrl(e.target.value)}
+                placeholder="https://example.com"
+                className="flex-1 bg-github-canvas border border-github-border rounded-md px-4 py-2 focus:border-github-accent outline-none transition-all placeholder:text-github-textSecondary"
+              />
+              <button
+                type="submit"
+                disabled={!crawlUrl.trim() || isCrawling}
+                className="bg-github-success hover:bg-opacity-90 text-white font-medium px-4 py-2 rounded-md flex items-center gap-2 transition-colors disabled:opacity-50"
               >
-                <Circle size={16} className="text-github-open" /> {openTodos.length} Open
+                {isCrawling ? 'Crawling...' : 'Ingest'}
               </button>
-              <button 
-                className={`flex items-center gap-1 text-sm font-medium hover:text-github-textMain transition-colors ${completedTodos.length > 0 ? 'text-github-textMain' : 'text-github-textSecondary'}`}
-              >
-                <CheckCircle2 size={16} className="text-github-closed" /> {completedTodos.length} Completed
-              </button>
-            </div>
-            <div className="flex items-center gap-4 text-sm text-github-textSecondary">
-              <div className="group cursor-pointer flex items-center gap-1 hover:text-github-accent">
-                Sort <ChevronDown size={14} />
-              </div>
-            </div>
+            </form>
           </div>
 
-          {/* List Items */}
-          <div className="divide-y divide-github-border">
-            {isLoading ? (
-              <div className="p-8 text-center text-github-textSecondary flex flex-col items-center gap-4">
-                <div className="w-8 h-8 border-2 border-github-accent border-t-transparent rounded-full animate-spin"></div>
-                <p>Loading your tasks...</p>
-              </div>
-            ) : todos.length === 0 ? (
-              <div className="p-16 text-center flex flex-col items-center gap-4">
-                <div className="text-github-textSecondary">
-                  <Info size={48} className="mx-auto opacity-20 mb-4" />
-                  <p className="text-lg font-semibold text-github-textMain">No todos found</p>
-                  <p className="text-sm">Add a task above to get started.</p>
-                </div>
-              </div>
-            ) : (
-              todos.map((todo) => (
-                <div 
-                  key={todo.id} 
-                  className="p-4 hover:bg-github-itemHover flex items-start gap-4 transition-colors group"
-                >
-                  <button 
-                    onClick={() => toggleMutation.mutate(todo.id)}
-                    disabled={toggleMutation.isPending}
-                    className={`mt-1 transition-colors ${todo.completed ? 'text-github-closed' : 'text-github-open hover:text-github-accent'} ${toggleMutation.isPending ? 'opacity-50' : ''}`}
-                  >
-                    {todo.completed ? <CheckCircle2 size={18} /> : <Circle size={18} />}
-                  </button>
-                  
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 mb-1">
-                      <h3 className={`font-semibold text-lg leading-tight truncate ${todo.completed ? 'text-github-textSecondary line-through' : 'text-github-textMain'}`}>
-                        {todo.title}
-                      </h3>
-                      {todo.completed && (
-                        <span className="bg-github-closed/10 text-github-closed border border-github-closed/20 text-[10px] uppercase font-bold px-1.5 py-0.5 rounded-full">
-                          Done
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-github-textSecondary">
-                      <span>#{todo.id.split('-')[0]}</span>
-                      <span>•</span>
-                      <span>created via rust-eventbus</span>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button 
-                      onClick={() => deleteMutation.mutate(todo.id)}
-                      disabled={deleteMutation.isPending}
-                      className="p-2 hover:bg-red-500/10 hover:text-red-400 rounded-md transition-all text-github-textSecondary disabled:opacity-50"
-                      title="Delete todo"
-                    >
-                      <Trash2 size={16} />
-                    </button>
-                  </div>
-                </div>
-              ))
-            )}
+          <div className="border border-github-border rounded-md bg-github-bg flex flex-col flex-1 shadow-sm overflow-hidden min-h-[300px]">
+            <div className="bg-github-header border-b border-github-border p-3">
+              <h3 className="text-sm font-semibold flex items-center gap-2 text-github-textSecondary">
+                <Info size={16} /> Live Logs
+              </h3>
+            </div>
+            <div className="p-4 flex-1 overflow-y-auto bg-[#0d1117] font-mono text-xs text-green-400 leading-relaxed max-h-[500px]">
+              {logs.length === 0 ? (
+                <span className="opacity-50">Waiting for events...</span>
+              ) : (
+                logs.map((log, i) => <div key={i}>{log}</div>)
+              )}
+            </div>
           </div>
         </div>
 
-        {/* Footer Info */}
-        <div className="mt-8 text-center text-xs text-github-textSecondary">
-          <p>© 2026 Antigravity Systems. Inspired by GitHub Issues.</p>
+        {/* Right Column: Search */}
+        <div className="flex flex-col gap-6">
+          <div className="border border-github-border rounded-md bg-github-bg p-6 shadow-sm">
+             <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+              <Search size={20} /> Search Graph
+            </h2>
+            <form onSubmit={handleSearch} className="flex gap-2">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Ask something..."
+                className="flex-1 bg-github-canvas border border-github-border rounded-md px-4 py-2 focus:border-github-accent outline-none transition-all placeholder:text-github-textSecondary"
+              />
+              <button
+                type="submit"
+                disabled={searchMutation.isPending || !searchQuery.trim()}
+                className="bg-github-accent hover:bg-opacity-90 text-white font-medium px-4 py-2 rounded-md flex items-center gap-2 transition-colors disabled:opacity-50"
+              >
+                {searchMutation.isPending ? 'Searching...' : 'Search'}
+              </button>
+            </form>
+          </div>
+
+          <div className="border border-github-border rounded-md bg-github-bg overflow-hidden shadow-sm flex-1 flex flex-col">
+            <div className="bg-github-header border-b border-github-border p-4 flex justify-between items-center">
+              <h3 className="text-sm font-semibold">Search Results</h3>
+              <span className="text-xs text-github-textSecondary">{searchResults.length} results found</span>
+            </div>
+            <div className="flex-1 overflow-y-auto max-h-[600px] divide-y divide-github-border">
+              {searchResults.length === 0 ? (
+                <div className="p-16 text-center text-github-textSecondary">
+                  <p>No results. Try searching or ingesting some data first.</p>
+                </div>
+              ) : (
+                searchResults.map((result, index) => (
+                  <div key={index} className="p-4 hover:bg-github-itemHover transition-colors">
+                    <div className="flex justify-between items-start mb-2">
+                       <h4 className="font-semibold text-[#58a6ff] hover:underline cursor-pointer">
+                         {result.title}
+                       </h4>
+                       <div className="flex gap-2 text-xs">
+                          <span className="bg-[#238636] bg-opacity-20 text-[#2ea043] px-2 py-1 rounded border border-[#2ea043]/30">
+                            Rerank: {result.rerank_score.toFixed(3)}
+                          </span>
+                          <span className="bg-[#1f6feb] bg-opacity-20 text-[#58a6ff] px-2 py-1 rounded border border-[#58a6ff]/30">
+                            Vector: {result.vector_score.toFixed(3)}
+                          </span>
+                       </div>
+                    </div>
+                    {result.section && (
+                       <p className="text-xs text-github-textSecondary mb-2 font-mono bg-github-canvas inline-block px-1 rounded">
+                         Section: {result.section}
+                       </p>
+                    )}
+                    <p className="text-sm text-github-textSecondary line-clamp-3">
+                      {result.content}
+                    </p>
+                    <p className="text-xs text-github-textSecondary mt-2 opacity-50 truncate">
+                       ID: {result.id}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
         </div>
+
       </main>
     </div>
   );

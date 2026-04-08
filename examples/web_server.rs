@@ -20,7 +20,6 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -38,6 +37,29 @@ struct EmbeddingRequest {
 #[derive(Debug, Serialize)]
 struct EmbeddingResponse {
     embedding: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchRequest {
+    query: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResultItem {
+    vector_score: f32,
+    rerank_score: f32,
+    id: String,
+    title: String,
+    section: String,
+    content: String,
+}
+
+// --- Helper for Similarity ---
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot / (norm_a * norm_b) }
 }
 
 struct AppState {
@@ -240,9 +262,13 @@ async fn main() -> Result<()> {
         _crawler: crawler,
     });
 
+    std::fs::create_dir_all("examples/outputs").unwrap_or_default();
+
     let app = Router::new()
         .route("/crawl", get(crawl_handler))
         .route("/embeddings", post(embeddings_handler))
+        .route("/search", post(search_handler))
+        .route("/save", post(save_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
@@ -250,6 +276,83 @@ async fn main() -> Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn search_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SearchRequest>,
+) -> impl IntoResponse {
+    let query_emb = match state.embedding_service.embed(&payload.query) {
+        Ok(emb) => emb,
+        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let graph = state.graph_state.read();
+    let mut initial_results = Vec::new();
+
+    // 1. STAGE 1: Vector Retrieval
+    for (id, node) in &graph.nodes {
+        if let Some(node_emb) = &node.embedding {
+            let score = cosine_similarity(&query_emb, node_emb);
+            if score > 0.3 {
+                let title = node.metadata.get("title").or(node.metadata.get("page_title")).cloned().unwrap_or(id.clone());
+                let section = node.metadata.get("section").cloned().unwrap_or_default();
+                let content = node.metadata.get("content").cloned().unwrap_or_default();
+                initial_results.push((score, id.clone(), title, section, content));
+            }
+        }
+    }
+
+    // Sort by vector score to get candidates
+    initial_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 2. STAGE 2: Reranking (Top 20)
+    let query_terms: Vec<String> = payload.query
+        .to_lowercase()
+        .split_whitespace()
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut final_results = Vec::new();
+    for (vector_score, id, title, section, content) in initial_results.into_iter().take(20) {
+        let mut boost = 0.0;
+        let content_lower = content.to_lowercase();
+        for term in &query_terms {
+            if content_lower.contains(term) {
+                boost += 0.1;
+            }
+        }
+
+        final_results.push(SearchResultItem {
+            vector_score,
+            rerank_score: vector_score + boost,
+            id,
+            title,
+            section,
+            content
+        });
+    }
+
+    // Sort by rerank score for final display
+    final_results.sort_by(|a, b| b.rerank_score.partial_cmp(&a.rerank_score).unwrap_or(std::cmp::Ordering::Equal));
+
+    Json(final_results).into_response()
+}
+
+async fn save_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let graph = state.graph_state.read();
+    match serde_json::to_string_pretty(&*graph) {
+        Ok(json) => {
+            match std::fs::write("examples/outputs/graph_state.json", json) {
+                Ok(_) => (axum::http::StatusCode::OK, "Graph saved to examples/outputs/graph_state.json").into_response(),
+                Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save graph: {}", e)).into_response(),
+            }
+        }
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to serialize graph: {}", e)).into_response(),
+    }
 }
 
 async fn embeddings_handler(
@@ -286,11 +389,11 @@ async fn crawl_handler(
     // Track session-specific progress to know when to close
     let mut requested_urls = HashSet::new();
     requested_urls.insert((*url).clone());
-    let mut ingested_urls = HashSet::new();
-    let mut created_nodes = HashSet::new();
-    let mut embedded_nodes = HashSet::new();
-    let mut last_activity = std::time::Instant::now();
-    let mut settle_count = 0;
+    let ingested_urls = HashSet::new();
+    let created_nodes = HashSet::new();
+    let embedded_nodes = HashSet::new();
+    let last_activity = std::time::Instant::now();
+    let settle_count = 0;
 
     let stream = stream::unfold((bus_rx, url, start_domain, requested_urls, ingested_urls, created_nodes, embedded_nodes, last_activity, settle_count), 
         move |(mut rx, url_arc, domain, mut req, mut ing, mut created, mut embedded, mut last, mut settle)| async move {
@@ -331,7 +434,7 @@ async fn crawl_handler(
                             }
                         }
                         AppEvent::Graph(graph_event) => {
-                            let (id, is_rel) = match &graph_event {
+                            let (_id, is_rel) = match &graph_event {
                                 GraphEvent::NodeCreated { id, .. } => (id.clone(), true),
                                 GraphEvent::EdgeAdded { from, to, .. } => (from.clone(), from.contains(&*url_arc) || to.contains(&*url_arc)),
                                 _ => (String::new(), false),
