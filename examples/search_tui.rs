@@ -52,6 +52,10 @@ impl Item for SearchResultItem {
 
 impl Display for SearchResultItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // We can't easily use Style here because Display should be plain text for many widgets
+        // but SearchResultItem is also used in SimpleDelegate which handles styling.
+        // Actually, List widget calls `item.to_string()` for filtering sometimes.
+        // Let's keep Display plain and handle the styling in the Delegate.
         write!(f, "[R:{:.3} V:{:.3}] {} - {}", self.rerank_score, self.vector_score, self.title, self.section)
     }
 }
@@ -86,10 +90,34 @@ struct SimpleDelegate<T> {
 
 impl<T: Item + Display + Send + Sync + 'static> ItemDelegate<T> for SimpleDelegate<T> {
     fn render(&self, m: &List<T>, index: usize, item: &T) -> String {
+        let text = item.to_string();
+        
+        // If it's a SearchResultItem, we apply custom color coding for the scores
+        let mut final_text = text;
+        if std::any::type_name::<T>().contains("SearchResultItem") {
+            // [R:1.200 V:0.800] -> [R:color V:color]
+            if let Some(r_pos) = final_text.find("R:") {
+                if let Some(v_pos) = final_text.find("V:") {
+                    if let Some(bracket_end) = final_text.find(']') {
+                        let r_val = &final_text[r_pos+2..v_pos-1];
+                        let v_val = &final_text[v_pos+2..bracket_end];
+                        
+                        let r_styled = Style::new().foreground("#00ff00").bold(true).render(r_val); // Green
+                        let v_styled = Style::new().foreground("#888888").render(v_val); // Grey
+
+                        final_text = format!("[R:{} V:{}] {}", 
+                            r_styled, 
+                            v_styled, 
+                            &final_text[bracket_end+2..]);
+                    }
+                }
+            }
+        }
+
         if index == m.cursor() {
-            format!("> {}", self.highlight_style.render(&item.to_string()))
+            format!("> {}", self.highlight_style.render(&final_text))
         } else {
-            format!("  {}", self.normal_style.render(&item.to_string()))
+            format!("  {}", self.normal_style.render(&final_text))
         }
     }
 
@@ -406,8 +434,20 @@ impl Model for GlobalModel {
                             self.0.mode = AppMode::Results;
                             return None;
                         }
-                        KeyCode::Backspace => { self.0.query.pop(); }
-                        KeyCode::Char(c) => { self.0.query.push(c); }
+                        KeyCode::Backspace => { 
+                            self.0.query.pop(); 
+                            let _ = self.0.perform_search();
+                        }
+                        KeyCode::Char(c) => { 
+                            self.0.query.push(c); 
+                            let _ = self.0.perform_search();
+                        }
+                        KeyCode::Down => {
+                            if !self.0.results_list.items().is_empty() {
+                                self.0.mode = AppMode::Results;
+                                return None;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -540,12 +580,18 @@ impl Model for GlobalModel {
             AppMode::Search => {
                 s.push_str("\n🔍 Search nodes by content similarity:\n");
                 s.push_str(&format!("> {}_\n", self.0.query));
-                s.push_str("\n[Enter] Search | [Esc] Exit");
+                
+                if !self.0.results_list.items().is_empty() {
+                    s.push_str("\n--- Live Results ---\n");
+                    s.push_str(&self.0.results_list.view());
+                }
+                
+                s.push_str("\n[Enter] Select | [Down] Navigate to list | [Esc] Exit");
             }
             AppMode::Results => {
-                s.push_str(&format!("\nResults for: '{}'\n", self.0.query));
+                s.push_str(&format!("\n🔍 Search: {}\n", self.0.query));
                 s.push_str(&self.0.results_list.view());
-                s.push_str("\n[Esc] Back to Search");
+                s.push_str("\n[Esc] Back to input | [Enter] View Details");
             }
             AppMode::Detail => {
                 if let Some(id) = &self.0.current_node_id {
