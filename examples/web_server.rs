@@ -374,17 +374,17 @@ async fn crawl_handler(
     
     info!("Crawl request (with embeddings & auto-close) for: {} (domain: {:?})", url, start_domain);
 
+    let bus_rx = state.bus.subscribe();
+
     // Initial trigger
     let _ = state.bus.publish(Event::new(
         "web-trigger",
-        0,
+        1,
         AppEvent::Crawler(CrawlerEvent::CrawlRequested {
             url: (*url).clone(),
             wait_selector: None,
         }),
     ));
-
-    let bus_rx = state.bus.subscribe();
     
     // Track session-specific progress to know when to close
     let mut requested_urls = HashSet::new();

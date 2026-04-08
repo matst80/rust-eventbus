@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { Search, Save, Globe, Info } from 'lucide-react';
+import { Search, Save, Globe, Info, ChevronDown, ChevronUp } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
 
 function App() {
   const [crawlUrl, setCrawlUrl] = useState('');
@@ -8,44 +9,56 @@ function App() {
   const [searchResults, setSearchResults] = useState([]);
   const [logs, setLogs] = useState([]);
   const [isCrawling, setIsCrawling] = useState(false);
+  const [expandedItems, setExpandedItems] = useState(new Set());
+
+  const toggleExpand = (id) => {
+    setExpandedItems(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const crawlMutation = useMutation({
     mutationFn: async (url) => {
-      setIsCrawling(true);
-      setLogs([]); // clear old logs
-      const eventSource = new EventSource(`/api/crawl?url=${encodeURIComponent(url)}`);
+      // In SSE, the GET request to the endpoint starts the action
+      // We don't need to return a long-running promise here if we handle state via listeners
+      return new Promise((resolve, reject) => {
+        setIsCrawling(true);
+        setLogs([]);
+        
+        const eventSource = new EventSource(`/api/crawl?url=${encodeURIComponent(url)}`);
 
-      eventSource.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          if (data.Graph && data.Graph.NodeCreated) {
-            setLogs(prev => [...prev, `Created node: ${data.Graph.NodeCreated.id}`]);
-          } else if (data.Graph && data.Graph.EdgeAdded) {
-            setLogs(prev => [...prev, `Added edge: ${data.Graph.EdgeAdded.from} -> ${data.Graph.EdgeAdded.to}`]);
-          } else if (data.Embedding && data.Embedding.EmbeddingExtracted) {
-             setLogs(prev => [...prev, `Extracted embedding for: ${data.Embedding.EmbeddingExtracted.id}`]);
+        eventSource.onopen = () => {
+          setLogs(prev => [...prev, `[System] Connected to crawl stream...`]);
+        };
+
+        eventSource.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.Graph && data.Graph.NodeCreated) {
+              setLogs(prev => [...prev, `Created node: ${data.Graph.NodeCreated.id}`]);
+            } else if (data.Graph && data.Graph.EdgeAdded) {
+              setLogs(prev => [...prev, `Added edge: ${data.Graph.EdgeAdded.from} -> ${data.Graph.EdgeAdded.to}`]);
+            } else if (data.Embedding && data.Embedding.EmbeddingExtracted) {
+               setLogs(prev => [...prev, `Extracted embedding for: ${data.Embedding.EmbeddingExtracted.id}`]);
+            }
+          } catch (e) {
+            console.error("Error parsing SSE data", e);
           }
-        } catch (e) {
-          console.error("Error parsing SSE data", e);
-        }
-      };
+        };
 
-      eventSource.onerror = (error) => {
-        console.error("EventSource failed:", error);
-        eventSource.close();
-        setIsCrawling(false);
-        setLogs(prev => [...prev, `[System] Crawl finished or disconnected.`]);
-      };
-
-      // we just return a promise that resolves when it's done for the mutation state
-      return new Promise((resolve) => {
-          const checkDone = setInterval(() => {
-              if(!isCrawling && eventSource.readyState === EventSource.CLOSED) {
-                  clearInterval(checkDone);
-                  resolve();
-              }
-          }, 500);
-      })
+        eventSource.onerror = (error) => {
+          // SSE usually reconnects, but we want to know when it's logically done or failed
+          // The server closes the stream when the individual crawl session is finished
+          console.log("EventSource closed or failed", error);
+          eventSource.close();
+          setIsCrawling(false);
+          setLogs(prev => [...prev, `[System] Crawl session finished.`]);
+          resolve();
+        };
+      });
     },
   });
 
@@ -182,34 +195,51 @@ function App() {
                   <p>No results. Try searching or ingesting some data first.</p>
                 </div>
               ) : (
-                searchResults.map((result, index) => (
-                  <div key={index} className="p-4 hover:bg-github-itemHover transition-colors">
-                    <div className="flex justify-between items-start mb-2">
-                       <h4 className="font-semibold text-[#58a6ff] hover:underline cursor-pointer">
-                         {result.title}
-                       </h4>
-                       <div className="flex gap-2 text-xs">
-                          <span className="bg-[#238636] bg-opacity-20 text-[#2ea043] px-2 py-1 rounded border border-[#2ea043]/30">
-                            Rerank: {result.rerank_score.toFixed(3)}
-                          </span>
-                          <span className="bg-[#1f6feb] bg-opacity-20 text-[#58a6ff] px-2 py-1 rounded border border-[#58a6ff]/30">
-                            Vector: {result.vector_score.toFixed(3)}
-                          </span>
-                       </div>
+                searchResults.map((result, index) => {
+                  const isExpanded = expandedItems.has(result.id);
+                  return (
+                    <div key={index} className="p-4 hover:bg-github-itemHover transition-colors">
+                      <div className="flex justify-between items-start mb-2 text-left">
+                        <div 
+                           onClick={() => toggleExpand(result.id)}
+                           className="flex-1 cursor-pointer group"
+                        >
+                          <h4 className="font-semibold text-[#58a6ff] group-hover:underline flex items-center gap-2">
+                            {result.title}
+                            {isExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+                          </h4>
+                        </div>
+                         <div className="flex gap-2 text-xs">
+                            <span className="bg-[#238636] bg-opacity-20 text-[#2ea043] px-2 py-1 rounded border border-[#2ea043]/30">
+                              Rerank: {result.rerank_score.toFixed(3)}
+                            </span>
+                            <span className="bg-[#1f6feb] bg-opacity-20 text-[#58a6ff] px-2 py-1 rounded border border-[#58a6ff]/30">
+                              Vector: {result.vector_score.toFixed(3)}
+                            </span>
+                         </div>
+                      </div>
+                      {result.section && (
+                         <p className="text-xs text-github-textSecondary mb-2 font-mono bg-github-canvas inline-block px-1 rounded">
+                           Section: {result.section}
+                         </p>
+                      )}
+                      
+                      {isExpanded ? (
+                        <div className="mt-3 p-4 bg-github-canvas rounded-md border border-github-border markdown-body text-sm">
+                          <ReactMarkdown>{result.content}</ReactMarkdown>
+                        </div>
+                      ) : (
+                        <p className="text-sm text-github-textSecondary line-clamp-3">
+                          {result.content}
+                        </p>
+                      )}
+                      
+                      <p className="text-xs text-github-textSecondary mt-2 opacity-50 truncate">
+                         ID: {result.id}
+                      </p>
                     </div>
-                    {result.section && (
-                       <p className="text-xs text-github-textSecondary mb-2 font-mono bg-github-canvas inline-block px-1 rounded">
-                         Section: {result.section}
-                       </p>
-                    )}
-                    <p className="text-sm text-github-textSecondary line-clamp-3">
-                      {result.content}
-                    </p>
-                    <p className="text-xs text-github-textSecondary mt-2 opacity-50 truncate">
-                       ID: {result.id}
-                    </p>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
