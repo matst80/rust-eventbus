@@ -95,6 +95,11 @@ impl<ES: EventStore<AppEvent>> EmbeddingProcessor<ES> {
                                 }
                             }
                         }
+                        AppEvent::Graph(GraphEvent::ResetEmbeddingCache) => {
+                            tracing::info!("Resetting embedding processor cache");
+                            processed_ids_rx.lock().clear();
+                            pending_ids_rx.lock().clear();
+                        }
                         _ => {}
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -174,10 +179,7 @@ impl<ES: EventStore<AppEvent>> EmbeddingProcessor<ES> {
         let batch_ids: Vec<&str> = item_meta.iter().map(|(id, _)| id.as_str()).collect();
 
         let service_clone = Arc::clone(service);
-        let result = tokio::task::spawn_blocking(move || {
-            service_clone.embed_batch(&texts)
-        })
-        .await;
+        let result = tokio::task::spawn_blocking(move || service_clone.embed_batch(&texts)).await;
 
         match result {
             Ok(Ok(embeddings)) => {

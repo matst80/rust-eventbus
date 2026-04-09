@@ -10,7 +10,6 @@ use axum::{
 };
 use futures::stream::{self};
 use http::header::HeaderValue;
-use pgvector::Vector;
 use rust_eventbus::{
     app_event::{AppEvent, GraphEvent},
     crawler::{CrawlerConfig, CrawlerEvent, CrawlerService},
@@ -19,19 +18,35 @@ use rust_eventbus::{
     Event, EventBus,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, Row};
+use sqlx::postgres::PgPoolOptions;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::info;
+use std::time::{Duration, Instant};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
+use uuid::Uuid;
+
+mod persistence;
+use persistence::PersistenceService;
 
 #[derive(Debug, Deserialize)]
 struct CrawlRequest {
     url: String,
     project_id: String,
+    #[serde(default = "default_max_crawls")]
+    max_crawls: usize,
+    #[serde(default = "default_max_chunks")]
+    max_chunks: usize,
+}
+
+fn default_max_crawls() -> usize {
+    500
+}
+fn default_max_chunks() -> usize {
+    50
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,98 +65,78 @@ struct SearchRequest {
     project_id: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResultItem {
-    vector_score: f32,
-    text_score: f32,
-    score: f32,
-    id: String,
-    page_url: String,
-    title: String,
-    section: String,
-    content: String,
-    chunk_index: i32,
+#[derive(Debug, Clone)]
+struct AppConfig {
+    max_crawls: usize,
+    max_chunks: usize,
+    session_timeout_secs: u64,
+    crawl_timeout_secs: u64,
+    db_max_connections: usize,
+    bus_capacity: usize,
+    crawler_concurrency: usize,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            max_crawls: std::env::var("MAX_CRAWLS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500),
+            max_chunks: std::env::var("MAX_CHUNKS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+            session_timeout_secs: std::env::var("SESSION_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
+            crawl_timeout_secs: std::env::var("CRAWL_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            db_max_connections: std::env::var("DB_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            bus_capacity: std::env::var("BUS_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096),
+            crawler_concurrency: std::env::var("CRAWLER_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+        }
+    }
+}
+
+struct SessionState {
+    session_id: String,
+    project_id: String,
+    start_domain: Option<String>,
+    max_crawls: usize,
+    requested: HashSet<String>,
+    visited: HashSet<String>,
+    counts: Arc<AtomicUsize>,
+    last_crawl: Instant,
 }
 
 struct AppState {
     bus: Arc<EventBus<AppEvent>>,
     embedding_service: Arc<OnnxEmbeddingService>,
-    db: sqlx::PgPool,
+    persistence: Arc<PersistenceService>,
     _crawler: Arc<CrawlerService>,
-    /// Maps crawled URL → project_id so async handlers can associate chunks
-    url_projects: Arc<parking_lot::RwLock<HashMap<String, String>>>,
-}
-
-async fn init_db(pool: &sqlx::PgPool) -> Result<()> {
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-        .execute(pool)
-        .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bge_pages (
-            url         TEXT NOT NULL,
-            project_id  TEXT NOT NULL,
-            title       TEXT,
-            crawled_at  TIMESTAMPTZ DEFAULT now(),
-            PRIMARY KEY (url, project_id)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bge_chunks (
-            id          TEXT NOT NULL,
-            project_id  TEXT NOT NULL,
-            page_url    TEXT NOT NULL,
-            chunk_index INT NOT NULL,
-            section     TEXT,
-            content     TEXT NOT NULL,
-            embedding   vector(384),
-            created_at  TIMESTAMPTZ DEFAULT now(),
-            PRIMARY KEY (id, project_id),
-            UNIQUE (page_url, project_id, chunk_index)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS bge_page_links (
-            from_url    TEXT NOT NULL,
-            to_url      TEXT NOT NULL,
-            project_id  TEXT NOT NULL,
-            PRIMARY KEY (from_url, to_url, project_id)
-        )",
-    )
-    .execute(pool)
-    .await?;
-
-    // HNSW works on empty tables (unlike IVFFlat)
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_bge_chunks_embedding
-         ON bge_chunks USING hnsw (embedding vector_cosine_ops)",
-    )
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_bge_chunks_project ON bge_chunks (project_id)")
-        .execute(pool)
-        .await?;
-
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_bge_chunks_page
-         ON bge_chunks (page_url, project_id, chunk_index)",
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
+    url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, Instant)>>>,
+    sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>>,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config = AppConfig::default();
+    info!("Starting with config: {:?}", config);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env()
@@ -150,37 +145,49 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Graceful shutdown flag
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+
     // 1. Database
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/eventbus".to_string());
     let db = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(config.db_max_connections as u32)
         .connect(&database_url)
         .await?;
-    init_db(&db).await?;
     info!("Connected to PostgreSQL");
 
-    // 2. Event store (still needed for EmbeddingProcessor replay)
+    // 2. Event store
     let temp_dir = tempfile::tempdir()?;
     let store_path = temp_dir.path().join("events_web.log");
     let event_store = Arc::new(FileEventStore::new(&store_path).await?);
 
     // 3. Event bus
-    let bus = Arc::new(EventBus::<AppEvent>::new(4096));
+    let bus = Arc::new(EventBus::<AppEvent>::new(config.bus_capacity));
 
     // 4. Crawler
     let crawler_config = CrawlerConfig {
-        concurrency: 2,
+        concurrency: config.crawler_concurrency,
         headless: true,
-        max_chunks: 50,
+        max_chunks: config.max_chunks,
         ..Default::default()
     };
     let crawler = Arc::new(CrawlerService::new(Arc::clone(&bus), crawler_config));
     let crawler_clone = Arc::clone(&crawler);
+    let shutdown_flag_worker = Arc::clone(&shutdown_flag_clone);
     tokio::spawn(async move {
-        if let Err(e) = crawler_clone.run().await {
-            tracing::error!("Crawler service failed: {}", e);
+        tokio::select! {
+            result = crawler_clone.run() => {
+                if let Err(e) = result {
+                    tracing::error!("Crawler service failed: {}", e);
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Crawler shutdown signal received");
+            }
         }
+        shutdown_flag_worker.store(true, Ordering::SeqCst);
     });
 
     // 5. Embedding service
@@ -188,6 +195,8 @@ async fn main() -> Result<()> {
     let downloader = ModelDownloader::new(model_cache);
     let (model_path, tokenizer_path) = downloader.get_bge_small().await?;
     let embedding_service = Arc::new(OnnxEmbeddingService::new(&model_path, &tokenizer_path)?);
+
+    let embedding_service_for_persistence = Arc::clone(&embedding_service);
 
     let embedding_processor = EmbeddingProcessor::new(
         Arc::clone(&embedding_service),
@@ -197,56 +206,170 @@ async fn main() -> Result<()> {
     .await?;
     embedding_processor.spawn().await;
 
-    // 6. Shared URL → project_id mapping
-    let url_projects: Arc<parking_lot::RwLock<HashMap<String, String>>> =
+    // 2. Persistence service
+    let persistence = Arc::new(PersistenceService::new(
+        Arc::new(db.clone()),
+        Arc::new(
+            move |text: &str| match embedding_service_for_persistence.embed(text) {
+                Ok(emb) => {
+                    tracing::debug!("Generated embedding of length {}", emb.len());
+                    emb
+                }
+                Err(e) => {
+                    tracing::error!("Failed to embed query: {}", e);
+                    vec![]
+                }
+            },
+        ),
+    ));
+    persistence.init_schema().await?;
+
+    // 6. Shared URL → (project_id, session_id) mapping with TTL-based cleanup
+    let url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, Instant)>>> =
         Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let url_projects_cleanup = Arc::clone(&url_projects);
+
+    // Sessions map for per-session state isolation
+    let sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>> =
+        Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let sessions_cleanup = Arc::clone(&sessions);
+
+    let session_ttl = std::env::var("SESSION_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600);
+    let cleanup_interval = Duration::from_secs(60);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(cleanup_interval);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut url_to_remove = Vec::new();
+            {
+                let map = url_projects_cleanup.read();
+                for (url, (_, _, timestamp)) in map.iter() {
+                    if now.duration_since(*timestamp) > Duration::from_secs(300) {
+                        url_to_remove.push(url.clone());
+                    }
+                }
+            }
+            if !url_to_remove.is_empty() {
+                let count = url_to_remove.len();
+                let mut map = url_projects_cleanup.write();
+                for url in url_to_remove {
+                    map.remove(&url);
+                }
+                info!("Cleaned up {} stale URL mappings", count);
+            }
+            let mut session_to_remove = Vec::new();
+            {
+                let map = sessions_cleanup.read();
+                for (session_id, state) in map.iter() {
+                    if now.duration_since(state.last_crawl) > Duration::from_secs(session_ttl) {
+                        session_to_remove.push(session_id.clone());
+                    }
+                }
+            }
+            if !session_to_remove.is_empty() {
+                let count = session_to_remove.len();
+                let mut map = sessions_cleanup.write();
+                for sid in session_to_remove {
+                    map.remove(&sid);
+                }
+                info!("Cleaned up {} stale sessions", count);
+            }
+        }
+    });
 
     // 7. Pipeline: events → Postgres storage + graph events for SSE
     let pipeline_bus = Arc::clone(&bus);
-    let pipeline_db = db.clone();
+    let pipeline_persistence = Arc::clone(&persistence);
     let pipeline_projects = Arc::clone(&url_projects);
     let mut pipeline_rx = bus.subscribe();
+    let config_clone = config.clone();
+
+    // Semaphore for bounded concurrent batch operations
+    let batch_semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+    let batch_semaphore_clone = Arc::clone(&batch_semaphore);
 
     tokio::spawn(async move {
-        let max_crawls = 500;
         let requested_counts: Arc<parking_lot::RwLock<HashMap<String, Arc<AtomicUsize>>>> =
             Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let visited: Arc<parking_lot::RwLock<HashMap<String, HashSet<String>>>> =
             Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let last_crawl: Arc<parking_lot::RwLock<HashMap<String, std::time::Instant>>> =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         while let Ok(event) = pipeline_rx.recv().await {
             match &event.payload {
+                AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, .. }) => {
+                    let (project_id, session_id, _) =
+                        match pipeline_projects.read().get(url).cloned() {
+                            Some((pid, sid, ts)) => (pid, sid, ts),
+                            None => continue,
+                        };
+
+                    let _should_reset = {
+                        let mut last_write = last_crawl.write();
+                        let mut counts_write = requested_counts.write();
+                        let mut visited_write = visited.write();
+
+                        let count = counts_write
+                            .get(&project_id)
+                            .map(|c| c.load(Ordering::Relaxed))
+                            .unwrap_or(0);
+                        let visited_count =
+                            visited_write.get(&project_id).map(|v| v.len()).unwrap_or(0);
+
+                        let last_time = last_write.get(&project_id).cloned();
+                        let should_reset = match last_time {
+                            Some(instant) => {
+                                instant.elapsed().as_secs() > config_clone.session_timeout_secs
+                                    || count >= config_clone.max_crawls
+                                    || visited_count == 0
+                            }
+                            None => true,
+                        };
+
+                        if should_reset {
+                            info!("Starting new crawl session for project: {}", project_id);
+                            counts_write.remove(&project_id);
+                            visited_write.remove(&project_id);
+                        }
+                        last_write.insert(project_id, std::time::Instant::now());
+
+                        should_reset
+                    };
+                }
                 AppEvent::Crawler(CrawlerEvent::PageIngested {
                     url,
                     title,
                     links,
                     chunks,
                 }) => {
-                    let project_id = match pipeline_projects.read().get(url).cloned() {
-                        Some(pid) => pid,
-                        None => continue,
-                    };
+                    let (project_id, session_id, _) =
+                        match pipeline_projects.read().get(url).cloned() {
+                            Some((pid, sid, ts)) => (pid, sid, ts),
+                            None => continue,
+                        };
 
                     info!("Pipeline: storing page {} (project {})", url, project_id);
 
                     // Upsert page
-                    if let Err(e) = sqlx::query(
-                        "INSERT INTO bge_pages (url, project_id, title) VALUES ($1, $2, $3)
-                         ON CONFLICT (url, project_id) DO UPDATE SET title = $3",
-                    )
-                    .bind(url)
-                    .bind(&project_id)
-                    .bind(title)
-                    .execute(&pipeline_db)
-                    .await
+                    if let Err(e) = pipeline_persistence
+                        .upsert_page(url, &project_id, title)
+                        .await
                     {
-                        tracing::error!("Failed to insert page: {}", e);
+                        tracing::error!("Failed to upsert page {}: {}", url, e);
                     }
 
-                    // Link discovery
+                    // Link discovery - collect links for batch insert
                     let start_domain = Url::parse(url)
                         .ok()
                         .and_then(|u| u.domain().map(|d| d.to_string()));
+
+                    let mut links_to_insert = Vec::new();
+                    let mut urls_to_crawl = Vec::new();
 
                     for target in links {
                         let mut target_url = match Url::parse(target) {
@@ -289,7 +412,9 @@ async fn main() -> Result<()> {
                             }
                         };
 
-                        if !is_same_domain || count.load(Ordering::Relaxed) >= max_crawls {
+                        if !is_same_domain
+                            || count.load(Ordering::Relaxed) >= config_clone.max_crawls
+                        {
                             continue;
                         }
 
@@ -303,116 +428,152 @@ async fn main() -> Result<()> {
                         }
                         count.fetch_add(1, Ordering::Relaxed);
 
-                        // Track project for discovered URL
-                        pipeline_projects
-                            .write()
-                            .insert(normalized.clone(), project_id.clone());
+                        // Track project for discovered URL with timestamp
+                        pipeline_projects.write().insert(
+                            normalized.clone(),
+                            (project_id.clone(), session_id.clone(), Instant::now()),
+                        );
 
-                        // Store link in Postgres
-                        let link_db = pipeline_db.clone();
-                        let link_from = url.clone();
-                        let link_to = normalized.clone();
-                        let link_pid = project_id.clone();
-                        tokio::spawn(async move {
-                            let _ = sqlx::query(
-                                "INSERT INTO bge_page_links (from_url, to_url, project_id)
-                                 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-                            )
-                            .bind(&link_from)
-                            .bind(&link_to)
-                            .bind(&link_pid)
-                            .execute(&link_db)
-                            .await;
-                        });
+                        // Queue link for batch insert
+                        links_to_insert.push((url.clone(), normalized.clone(), project_id.clone()));
 
-                        // Trigger crawl
-                        let _ = pipeline_bus.publish(Event::new(
-                            "discovery",
-                            event.sequence_num + 1,
-                            AppEvent::Crawler(CrawlerEvent::CrawlRequested {
-                                url: normalized.clone(),
-                                wait_selector: None,
-                            }),
-                        ));
+                        // Queue URL for crawling
+                        urls_to_crawl.push(normalized.clone());
 
                         // Publish edge for SSE
-                        let _ = pipeline_bus.publish(Event::new(
+                        if let Err(e) = pipeline_bus.publish(Event::new(
                             url,
                             event.sequence_num + 1,
                             AppEvent::Graph(GraphEvent::EdgeAdded {
                                 from: url.clone(),
-                                to: normalized,
+                                to: normalized.clone(),
                                 relation: "links_to".into(),
                                 weight: 1.0,
                             }),
-                        ));
+                        )) {
+                            warn!("Failed to publish edge event: {}", e);
+                        }
                     }
 
-                    // Store chunks
-                    for (i, chunk) in chunks.iter().enumerate() {
-                        let chunk_id = format!("{}#chunk-{}", url, i);
-                        let section = if chunk.headers.is_empty() {
-                            None
-                        } else {
-                            Some(chunk.headers.join(" > "))
-                        };
+                    // Batch insert links
+                    if !links_to_insert.is_empty() {
+                        let persist = Arc::clone(&pipeline_persistence);
+                        let sem = Arc::clone(&batch_semaphore_clone);
+                        tokio::spawn(async move {
+                            let _permit = sem.acquire().await;
+                            if let Err(e) = persist.insert_links_batch(links_to_insert).await {
+                                tracing::error!("Failed to insert links batch: {}", e);
+                            }
+                        });
+                    }
 
-                        if let Err(e) = sqlx::query(
-                            "INSERT INTO bge_chunks (id, project_id, page_url, chunk_index, section, content)
-                             VALUES ($1, $2, $3, $4, $5, $6)
-                             ON CONFLICT (id, project_id) DO NOTHING",
-                        )
-                        .bind(&chunk_id)
-                        .bind(&project_id)
-                        .bind(url)
-                        .bind(i as i32)
-                        .bind(&section)
-                        .bind(&chunk.content)
-                        .execute(&pipeline_db)
-                        .await
-                        {
-                            tracing::error!("Failed to insert chunk: {}", e);
+                    // Batch insert chunks
+                    let chunks_to_insert: Vec<(
+                        String,
+                        String,
+                        String,
+                        i32,
+                        Option<String>,
+                        String,
+                    )> = chunks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, chunk)| {
+                            let chunk_id = format!("{}#chunk-{}", url, i);
+                            let section = if chunk.headers.is_empty() {
+                                None
+                            } else {
+                                Some(chunk.headers.join(" > "))
+                            };
+                            (
+                                chunk_id,
+                                project_id.clone(),
+                                url.clone(),
+                                i as i32,
+                                section,
+                                chunk.content.clone(),
+                            )
+                        })
+                        .collect();
+
+                    if !chunks_to_insert.is_empty() {
+                        let persist = Arc::clone(&pipeline_persistence);
+                        let sem = Arc::clone(&batch_semaphore_clone);
+                        tokio::spawn(async move {
+                            let _permit = sem.acquire().await;
+                            if let Err(e) = persist.insert_chunks_batch(chunks_to_insert).await {
+                                tracing::error!("Failed to insert chunks batch: {}", e);
+                            }
+                        });
+
+                        // Publish NodeCreated events for SSE
+                        for (i, chunk) in chunks.iter().enumerate() {
+                            let chunk_id = format!("{}#chunk-{}", url, i);
+                            let section = if chunk.headers.is_empty() {
+                                None
+                            } else {
+                                Some(chunk.headers.join(" > "))
+                            };
+
+                            let mut metadata = HashMap::new();
+                            metadata.insert("type".into(), "chunk".into());
+                            metadata.insert("page_title".into(), title.clone());
+                            metadata.insert("content".into(), chunk.content.clone());
+                            if let Some(ref s) = section {
+                                metadata.insert("section".into(), s.clone());
+                            }
+
+                            if let Err(e) = pipeline_bus.publish(Event::new(
+                                &chunk_id,
+                                event.sequence_num + 2,
+                                AppEvent::Graph(GraphEvent::NodeCreated {
+                                    id: chunk_id.clone(),
+                                    metadata,
+                                }),
+                            )) {
+                                warn!("Failed to publish NodeCreated event: {}", e);
+                            }
+
+                            // Publish part_of edge for SSE
+                            if let Err(e) = pipeline_bus.publish(Event::new(
+                                &chunk_id,
+                                event.sequence_num + 3,
+                                AppEvent::Graph(GraphEvent::EdgeAdded {
+                                    from: chunk_id.clone(),
+                                    to: url.clone(),
+                                    relation: "part_of".into(),
+                                    weight: 1.0,
+                                }),
+                            )) {
+                                warn!("Failed to publish part_of edge: {}", e);
+                            }
+
+                            // Request embedding (consumed by EmbeddingProcessor)
+                            if let Err(e) = pipeline_bus.publish(Event::new(
+                                &chunk_id,
+                                event.sequence_num + 4,
+                                AppEvent::Graph(GraphEvent::RequestEmbedding {
+                                    id: chunk_id.clone(),
+                                    content: format!("Page: {}\nChunk: {}", title, chunk.content),
+                                }),
+                            )) {
+                                warn!("Failed to publish RequestEmbedding: {}", e);
+                            }
                         }
+                    }
 
-                        // Publish NodeCreated for SSE
-                        let mut metadata = HashMap::new();
-                        metadata.insert("type".into(), "chunk".into());
-                        metadata.insert("page_title".into(), title.clone());
-                        metadata.insert("content".into(), chunk.content.clone());
-                        if let Some(ref s) = section {
-                            metadata.insert("section".into(), s.clone());
+                    // Trigger new crawls
+                    for normalized in urls_to_crawl {
+                        if let Err(e) = pipeline_bus.publish(Event::new(
+                            "discovery",
+                            event.sequence_num + 1,
+                            AppEvent::Crawler(CrawlerEvent::CrawlRequested {
+                                url: normalized,
+                                wait_selector: None,
+                            }),
+                        )) {
+                            warn!("Failed to publish CrawlRequested: {}", e);
                         }
-
-                        let _ = pipeline_bus.publish(Event::new(
-                            &chunk_id,
-                            event.sequence_num + 2,
-                            AppEvent::Graph(GraphEvent::NodeCreated {
-                                id: chunk_id.clone(),
-                                metadata,
-                            }),
-                        ));
-
-                        // Publish part_of edge for SSE
-                        let _ = pipeline_bus.publish(Event::new(
-                            &chunk_id,
-                            event.sequence_num + 3,
-                            AppEvent::Graph(GraphEvent::EdgeAdded {
-                                from: chunk_id.clone(),
-                                to: url.clone(),
-                                relation: "part_of".into(),
-                                weight: 1.0,
-                            }),
-                        ));
-
-                        // Request embedding (consumed by EmbeddingProcessor)
-                        let _ = pipeline_bus.publish(Event::new(
-                            &chunk_id,
-                            event.sequence_num + 4,
-                            AppEvent::Graph(GraphEvent::RequestEmbedding {
-                                id: chunk_id.clone(),
-                                content: format!("Page: {}\nChunk: {}", title, chunk.content),
-                            }),
-                        ));
                     }
                 }
 
@@ -423,27 +584,37 @@ async fn main() -> Result<()> {
                         embedding,
                     },
                 ) => {
+                    tracing::debug!("Received embedding extracted for id: {}", id);
                     let page_url = match id.rsplit_once("#chunk-") {
                         Some((url, _)) => url,
-                        None => continue,
+                        None => {
+                            tracing::warn!("Could not parse page_url from id: {}", id);
+                            continue;
+                        }
                     };
                     let project_id = match pipeline_projects.read().get(page_url).cloned() {
-                        Some(pid) => pid,
-                        None => continue,
+                        Some((pid, _, _)) => pid,
+                        None => {
+                            tracing::warn!("No project_id found for page_url: {}", page_url);
+                            continue;
+                        }
                     };
+                    tracing::debug!("Updating embedding for id: {} project: {}", id, project_id);
 
-                    let vec = Vector::from(embedding.clone());
-                    if let Err(e) = sqlx::query(
-                        "UPDATE bge_chunks SET embedding = $1 WHERE id = $2 AND project_id = $3",
-                    )
-                    .bind(vec)
-                    .bind(id)
-                    .bind(&project_id)
-                    .execute(&pipeline_db)
-                    .await
-                    {
-                        tracing::error!("Failed to update embedding: {}", e);
-                    }
+                    // Batch update embedding
+                    let persist = Arc::clone(&pipeline_persistence);
+                    let sem = Arc::clone(&batch_semaphore_clone);
+                    let id_clone = id.clone();
+                    let embed_clone = embedding.to_vec();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
+                        if let Err(e) = persist
+                            .update_embeddings_batch(vec![(id_clone, project_id, embed_clone)])
+                            .await
+                        {
+                            tracing::error!("Failed to update embeddings batch: {}", e);
+                        }
+                    });
                 }
 
                 _ => {}
@@ -455,16 +626,28 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         bus,
         embedding_service,
-        db,
+        persistence,
         _crawler: crawler,
         url_projects,
+        sessions,
+        shutdown_flag,
     });
 
     let app = Router::new()
+        .route("/health", get(health_handler))
         .route("/crawl", get(crawl_handler))
         .route("/embeddings", post(embeddings_handler))
         .route("/search", post(search_handler))
         .with_state(state);
+
+    // Graceful shutdown handler
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+        info!("Shutdown signal received");
+        shutdown_flag_clone.store(true, Ordering::SeqCst);
+    });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3010").await?;
     info!("Listening on http://0.0.0.0:3010");
@@ -475,67 +658,37 @@ async fn main() -> Result<()> {
 
 // --- Handlers ---
 
+fn make_progress(
+    session_id: &str,
+    pending: &HashSet<String>,
+    embedded: &HashSet<String>,
+    ing: &HashSet<String>,
+    req: &HashSet<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "progress",
+        "session_id": session_id,
+        "total_nodes": pending.len() + embedded.len(),
+        "embedded_nodes": embedded.len(),
+        "ingested_urls": ing.len(),
+        "requested_urls": req.len()
+    })
+}
+
+async fn health_handler() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
 async fn search_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SearchRequest>,
 ) -> impl IntoResponse {
-    let query_emb = match state.embedding_service.embed(&payload.query) {
-        Ok(emb) => emb,
-        Err(e) => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-        }
-    };
-
-    let query_vec = Vector::from(query_emb);
-
-    let rows = sqlx::query(
-        "SELECT
-            c.id,
-            c.page_url,
-            COALESCE(p.title, c.page_url) AS title,
-            COALESCE(c.section, '') AS section,
-            c.content,
-            c.chunk_index,
-            (1 - (c.embedding <=> $1))::real AS vector_score,
-            ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $2)) AS text_score
-        FROM bge_chunks c
-        JOIN bge_pages p ON c.page_url = p.url AND c.project_id = p.project_id
-        WHERE c.project_id = $3
-          AND c.embedding IS NOT NULL
-        ORDER BY
-            (1 - (c.embedding <=> $1))::real * 0.7
-            + ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $2)) * 0.3
-            DESC
-        LIMIT 20",
-    )
-    .bind(&query_vec)
-    .bind(&payload.query)
-    .bind(&payload.project_id)
-    .fetch_all(&state.db)
-    .await;
-
-    match rows {
-        Ok(rows) => {
-            let results: Vec<SearchResultItem> = rows
-                .iter()
-                .map(|row| {
-                    let vector_score: f32 = row.get("vector_score");
-                    let text_score: f32 = row.get("text_score");
-                    SearchResultItem {
-                        vector_score,
-                        text_score,
-                        score: vector_score * 0.7 + text_score * 0.3,
-                        id: row.get("id"),
-                        page_url: row.get("page_url"),
-                        title: row.get("title"),
-                        section: row.get("section"),
-                        content: row.get("content"),
-                        chunk_index: row.get("chunk_index"),
-                    }
-                })
-                .collect();
-            Json(results).into_response()
-        }
+    match state
+        .persistence
+        .search(&payload.query, &payload.project_id)
+        .await
+    {
+        Ok(results) => Json(results).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -555,95 +708,183 @@ async fn crawl_handler(
     Query(params): Query<CrawlRequest>,
 ) -> impl IntoResponse {
     let url = Arc::new(params.url);
-    let project_id = params.project_id;
+    let project_id = params.project_id.clone();
     let start_domain = Url::parse(&url)
         .ok()
         .and_then(|u| u.domain().map(|d| d.to_string()));
 
+    let session_id = Uuid::new_v4().to_string();
+
     info!(
-        "Crawl request for: {} project: {} (domain: {:?})",
-        url, project_id, start_domain
+        "Crawl request for: {} project: {} (domain: {:?}) session: {} max_crawls: {} max_chunks: {}",
+        url, project_id, start_domain, session_id, params.max_crawls, params.max_chunks
     );
 
-    // Register URL → project_id so the pipeline handler can find it
+    let session_state = SessionState {
+        session_id: session_id.clone(),
+        project_id: project_id.clone(),
+        start_domain: start_domain.clone(),
+        max_crawls: params.max_crawls,
+        requested: HashSet::new(),
+        visited: HashSet::new(),
+        counts: Arc::new(AtomicUsize::new(0)),
+        last_crawl: Instant::now(),
+    };
+
     state
-        .url_projects
+        .sessions
         .write()
-        .insert((*url).clone(), project_id);
+        .insert(session_id.clone(), session_state);
 
-    let bus_rx = state.bus.subscribe();
+    state.url_projects.write().insert(
+        (*url).clone(),
+        (project_id, session_id.clone(), Instant::now()),
+    );
 
-    // Kick off the crawl
-    let _ = state.bus.publish(Event::new(
+    // Kick off the crawl AFTER registering the mapping
+    if let Err(e) = state.bus.publish(Event::new(
         "web-trigger",
         1,
         AppEvent::Crawler(CrawlerEvent::CrawlRequested {
             url: (*url).clone(),
             wait_selector: None,
         }),
-    ));
+    )) {
+        warn!("Failed to publish initial crawl request: {}", e);
+    }
+
+    // Subscribe to events AFTER publishing to ensure we receive all events
+    let bus_rx = state.bus.subscribe();
 
     // Track session progress for SSE completion
+    let session_id_clone = session_id.clone();
     let mut requested_urls = HashSet::new();
     requested_urls.insert((*url).clone());
     let ingested_urls = HashSet::new();
-    let created_nodes = HashSet::new();
-    let embedded_nodes = HashSet::new();
+    let pending_chunks = HashSet::new();
+    let embedded_chunks = HashSet::new();
     let last_activity = std::time::Instant::now();
-    let settle_count = 0;
+    let idle_count = 0;
+    let state_clone = Arc::clone(&state);
+    let config_for_sse = AppConfig::default();
 
     let stream = stream::unfold(
         (
             bus_rx,
             url,
+            session_id_clone,
             start_domain,
             requested_urls,
             ingested_urls,
-            created_nodes,
-            embedded_nodes,
+            pending_chunks,
+            embedded_chunks,
             last_activity,
-            settle_count,
+            idle_count,
+            state_clone,
         ),
         move |(
             mut rx,
             url_arc,
+            session_id,
             domain,
             mut req,
             mut ing,
-            mut created,
-            mut embedded,
+            mut pending_chunks,
+            mut embedded_chunks,
             mut last,
-            mut settle,
+            mut idle_count,
+            state_clone,
         )| async move {
             loop {
-                let is_done = !ing.is_empty()
-                    && ing.len() >= req.len()
-                    && !created.is_empty()
-                    && embedded.len() >= created.len();
+                // Track progress
+                let total_chunks = pending_chunks.len() + embedded_chunks.len();
+                let embedded_count = embedded_chunks.len();
 
-                if is_done {
-                    settle += 1;
-                    if settle > 3 {
-                        info!("Crawl session completed for: {}", url_arc);
-                        let progress_json = serde_json::json!({
-                            "type": "progress",
-                            "total_nodes": created.len(),
-                            "embedded_nodes": embedded.len(),
-                            "ingested_urls": ing.len(),
-                            "requested_urls": req.len()
-                        });
-                        return Some((
-                            Ok(SseEvent::default().data(progress_json.to_string())),
-                            (
-                                rx, url_arc, domain, req, ing, created, embedded, last, settle,
-                            ),
-                        ));
+                // Completion: no pending chunks and we've been idle for a bit
+                let is_complete = pending_chunks.is_empty() && !req.is_empty() && idle_count >= 2;
+
+                // After completion is sent, end the stream
+                if is_complete && idle_count >= 3 {
+                    info!("Crawl session ended for: {}", url_arc);
+                    // Reset embedding cache for next crawl session
+                    let _ = state_clone.bus.publish(Event::new(
+                        "reset",
+                        1,
+                        AppEvent::Graph(GraphEvent::ResetEmbeddingCache),
+                    ));
+                    // Clean up session state
+                    state_clone.sessions.write().remove(&session_id);
+                    let mut urls_to_remove = Vec::new();
+                    {
+                        let map = state_clone.url_projects.read();
+                        for (url, (_, sid, _)) in map.iter() {
+                            if sid == &session_id {
+                                urls_to_remove.push(url.clone());
+                            }
+                        }
                     }
-                } else if last.elapsed().as_secs() > 30 && !ing.is_empty() {
-                    info!("Crawl session timed out for: {}", url_arc);
+                    if !urls_to_remove.is_empty() {
+                        let mut map = state_clone.url_projects.write();
+                        for url in urls_to_remove {
+                            map.remove(&url);
+                        }
+                    }
+                    info!("Cleaned up session: {}", session_id);
                     return None;
                 }
 
+                if is_complete {
+                    info!(
+                        "Crawl session completed for: {} ({} chunks)",
+                        url_arc, embedded_count
+                    );
+                    // Send final progress and increment idle to signal we're done
+                    idle_count += 1;
+                    let progress_json =
+                        make_progress(&session_id, &pending_chunks, &embedded_chunks, &ing, &req);
+                    return Some((
+                        Ok(SseEvent::default().data(progress_json.to_string())),
+                        (
+                            rx,
+                            url_arc,
+                            session_id,
+                            domain,
+                            req,
+                            ing,
+                            pending_chunks,
+                            embedded_chunks,
+                            last,
+                            idle_count,
+                            state_clone,
+                        ),
+                    ));
+                }
+
+                // Timeout check using configurable timeout
+                let has_activity = !req.is_empty() || !ing.is_empty() || total_chunks > 0;
+                if has_activity && last.elapsed().as_secs() > config_for_sse.crawl_timeout_secs {
+                    info!("Crawl session timed out for: {}", url_arc);
+                    let progress_json =
+                        make_progress(&session_id, &pending_chunks, &embedded_chunks, &ing, &req);
+                    return Some((
+                        Ok(SseEvent::default().data(progress_json.to_string())),
+                        (
+                            rx,
+                            url_arc,
+                            session_id,
+                            domain,
+                            req,
+                            ing,
+                            pending_chunks,
+                            embedded_chunks,
+                            last,
+                            idle_count,
+                            state_clone,
+                        ),
+                    ));
+                }
+
+                // Wait for next event
                 match tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await {
                     Ok(Ok(event)) => match event.payload {
                         AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, .. }) => {
@@ -656,51 +897,82 @@ async fn crawl_handler(
                                 {
                                     if req.insert(url.clone()) {
                                         last = std::time::Instant::now();
-                                        settle = 0;
+                                        idle_count = 0;
                                     }
                                 }
                             }
                         }
-                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, .. }) => {
+                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, chunks, .. }) => {
                             if req.contains(&url) {
-                                if ing.insert(url) {
+                                if ing.insert(url.clone()) {
                                     last = std::time::Instant::now();
-                                    settle = 0;
+                                    idle_count = 0;
+
+                                    // Add chunks to pending
+                                    let chunk_count = chunks.len().max(1);
+                                    for i in 0..chunk_count {
+                                        let chunk_id = format!("{}#chunk-{}", url, i);
+                                        pending_chunks.insert(chunk_id);
+                                    }
+
+                                    // Send progress update
+                                    let progress_json = make_progress(
+                                        &session_id,
+                                        &pending_chunks,
+                                        &embedded_chunks,
+                                        &ing,
+                                        &req,
+                                    );
+                                    return Some((
+                                        Ok(SseEvent::default().data(progress_json.to_string())),
+                                        (
+                                            rx,
+                                            url_arc,
+                                            session_id,
+                                            domain,
+                                            req,
+                                            ing,
+                                            pending_chunks,
+                                            embedded_chunks,
+                                            last,
+                                            idle_count,
+                                            state_clone,
+                                        ),
+                                    ));
                                 }
                             }
                         }
-                        AppEvent::Graph(graph_event) => {
-                            let (_id, is_rel) = match &graph_event {
-                                GraphEvent::NodeCreated { id, .. } => (id.clone(), true),
-                                GraphEvent::EdgeAdded { from, to, .. } => (
-                                    from.clone(),
-                                    from.contains(&*url_arc) || to.contains(&*url_arc),
-                                ),
-                                _ => (String::new(), false),
-                            };
-
-                            if is_rel {
-                                if let GraphEvent::NodeCreated {
-                                    id: ref node_id, ..
-                                } = graph_event
-                                {
-                                    created.insert(node_id.clone());
-                                }
+                        AppEvent::Graph(GraphEvent::NodeCreated { id: _, .. }) => {
+                            last = std::time::Instant::now();
+                            idle_count = 0;
+                        }
+                        AppEvent::Graph(GraphEvent::EdgeAdded { from, to, .. }) => {
+                            if from.contains(&*url_arc) || to.contains(&*url_arc) {
                                 last = std::time::Instant::now();
-                                settle = 0;
+                                idle_count = 0;
 
-                                let progress_json = serde_json::json!({
-                                    "type": "progress",
-                                    "total_nodes": created.len(),
-                                    "embedded_nodes": embedded.len(),
-                                    "ingested_urls": ing.len(),
-                                    "requested_urls": req.len()
-                                });
+                                // Send progress update
+                                let progress_json = make_progress(
+                                    &session_id,
+                                    &pending_chunks,
+                                    &embedded_chunks,
+                                    &ing,
+                                    &req,
+                                );
                                 return Some((
                                     Ok(SseEvent::default().data(progress_json.to_string())),
                                     (
-                                        rx, url_arc, domain, req, ing, created, embedded, last,
-                                        settle,
+                                        rx,
+                                        url_arc,
+                                        session_id,
+                                        domain,
+                                        req,
+                                        ing,
+                                        pending_chunks,
+                                        embedded_chunks,
+                                        last,
+                                        idle_count,
+                                        state_clone,
                                     ),
                                 ));
                             }
@@ -708,35 +980,47 @@ async fn crawl_handler(
                         AppEvent::Embedding(
                             rust_eventbus::embedding::event::EmbeddingEvent::EmbeddingExtracted {
                                 id,
-                                embedding: _,
+                                ..
                             },
                         ) => {
-                            if created.contains(&id) {
-                                if embedded.insert(id.clone()) {
-                                    last = std::time::Instant::now();
-                                    settle = 0;
+                            if pending_chunks.remove(&id) {
+                                embedded_chunks.insert(id);
+                                last = std::time::Instant::now();
+                                idle_count = 0;
 
-                                    let progress_json = serde_json::json!({
-                                        "type": "progress",
-                                        "total_nodes": created.len(),
-                                        "embedded_nodes": embedded.len(),
-                                        "ingested_urls": ing.len(),
-                                        "requested_urls": req.len()
-                                    });
-                                    return Some((
-                                        Ok(SseEvent::default().data(progress_json.to_string())),
-                                        (
-                                            rx, url_arc, domain, req, ing, created, embedded, last,
-                                            settle,
-                                        ),
-                                    ));
-                                }
+                                // Send progress update
+                                let progress_json = make_progress(
+                                    &session_id,
+                                    &pending_chunks,
+                                    &embedded_chunks,
+                                    &ing,
+                                    &req,
+                                );
+                                return Some((
+                                    Ok(SseEvent::default().data(progress_json.to_string())),
+                                    (
+                                        rx,
+                                        url_arc,
+                                        session_id,
+                                        domain,
+                                        req,
+                                        ing,
+                                        pending_chunks,
+                                        embedded_chunks,
+                                        last,
+                                        idle_count,
+                                        state_clone,
+                                    ),
+                                ));
                             }
                         }
                         _ => {}
                     },
                     Ok(Err(_)) => return None,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // Timeout - increment idle counter
+                        idle_count += 1;
+                    }
                 }
             }
         },

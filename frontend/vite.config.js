@@ -10,10 +10,17 @@ export default defineConfig({
   ],
   server: {
     proxy: {
-      '/api': {
-        target: 'http://localhost:3000',
+      '/crawl': {
+        target: 'http://localhost:3010',
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
+      },
+      '/search': {
+        target: 'http://localhost:3010',
+        changeOrigin: true,
+      },
+      '/embeddings': {
+        target: 'http://localhost:3010',
+        changeOrigin: true,
       },
     },
   },

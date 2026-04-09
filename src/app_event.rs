@@ -28,6 +28,7 @@ pub enum GraphEvent {
         id: String,
         content: String,
     },
+    ResetEmbeddingCache,
 }
 
 impl EventPayload for AppEvent {
@@ -46,6 +47,7 @@ impl EventPayload for GraphEvent {
             GraphEvent::NodeCreated { .. } => "GraphEvent::NodeCreated",
             GraphEvent::EdgeAdded { .. } => "GraphEvent::EdgeAdded",
             GraphEvent::RequestEmbedding { .. } => "GraphEvent::RequestEmbedding",
+            GraphEvent::ResetEmbeddingCache => "GraphEvent::ResetEmbeddingCache",
         }
     }
 }
