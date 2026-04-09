@@ -4,6 +4,7 @@ use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::Page;
 use futures::StreamExt;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
@@ -27,6 +28,8 @@ pub struct CrawlerConfig {
     pub should_exclude_url: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     /// Maximum number of chunks emitted per crawled page.
     pub max_chunks: usize,
+    /// Optional shutdown flag - when set to true, crawler stops.
+    pub shutdown_flag: Option<Arc<AtomicBool>>,
 }
 
 impl fmt::Debug for CrawlerConfig {
@@ -37,6 +40,7 @@ impl fmt::Debug for CrawlerConfig {
             .field("user_data_dir", &self.user_data_dir)
             .field("should_exclude_url", &"<delegate>")
             .field("max_chunks", &self.max_chunks)
+            .field("shutdown_flag", &self.shutdown_flag.is_some())
             .finish()
     }
 }
@@ -51,6 +55,7 @@ impl Default for CrawlerConfig {
                 url == "https://doc.rust-lang.org/releases.html"
             }),
             max_chunks: 50,
+            shutdown_flag: None,
         }
     }
 }
@@ -100,10 +105,10 @@ impl CrawlerService {
 
         // Find chrome/chromium binary
         if let Ok(bin) = std::env::var("CHROME_BIN") {
-             if std::path::Path::new(&bin).exists() {
-                 info!("Using browser binary from CHROME_BIN: {}", bin);
-                 builder = builder.chrome_executable(bin);
-             }
+            if std::path::Path::new(&bin).exists() {
+                info!("Using browser binary from CHROME_BIN: {}", bin);
+                builder = builder.chrome_executable(bin);
+            }
         } else if cfg!(target_os = "macos") {
             let paths = [
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -185,13 +190,7 @@ impl CrawlerService {
                             }
 
                             info!("Runner #{} processing: {}", i, url);
-                            match Self::process_crawl(
-                                &page,
-                                &url,
-                                wait_selector,
-                                max_chunks,
-                            )
-                            .await
+                            match Self::process_crawl(&page, &url, wait_selector, max_chunks).await
                             {
                                 Ok((title, links, chunks)) => {
                                     info!(
@@ -237,10 +236,21 @@ impl CrawlerService {
         }
 
         // --- Main Event Loop ---
+        // Check for external shutdown flag
+        let shutdown_flag = self.config.shutdown_flag.clone();
+
         let mut rx = self.bus.subscribe();
         loop {
             tokio::select! {
                 Ok(event) = rx.recv() => {
+                    // Check shutdown flag
+                    if let Some(ref flag) = shutdown_flag {
+                        if flag.load(Ordering::SeqCst) {
+                            info!("Shutdown flag set - stopping crawler");
+                            break;
+                        }
+                    }
+
                     if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { .. }) = &event.payload {
                         // Queue the task
                         if let Err(e) = tx.send(event).await {
@@ -256,6 +266,17 @@ impl CrawlerService {
             }
         }
 
+        // Signal workers to stop by dropping the sender
+        info!("Closing crawler worker channels");
+        drop(tx);
+
+        // Wait a moment for workers to finish
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Browser will be closed when it drops
+        // Explicit close would require Arc::try_unwrap or using a different pattern
+        info!("Crawler service stopped");
+
         Ok(())
     }
 
@@ -268,9 +289,7 @@ impl CrawlerService {
         wait_selector: Option<String>,
         max_chunks: usize,
     ) -> Result<(String, Vec<String>, Vec<Chunk>)> {
-        page.goto(url)
-            .await
-            .context("Failed to navigate to URL")?;
+        page.goto(url).await.context("Failed to navigate to URL")?;
 
         if let Some(selector) = wait_selector {
             info!("Waiting for selector: {}", selector);
@@ -282,8 +301,9 @@ impl CrawlerService {
             // We use a short timeout to handle cases where Chrome's PDF viewer is slow to settle.
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                page.wait_for_navigation()
-            ).await;
+                page.wait_for_navigation(),
+            )
+            .await;
         }
 
         let content_type = page
@@ -316,37 +336,42 @@ impl CrawlerService {
                     return btoa(binary);
                 })()
             "#;
-            
-            let b64: String = page.evaluate(b64_script).await?
+
+            let b64: String = page
+                .evaluate(b64_script)
+                .await?
                 .into_value::<String>()
                 .context("Failed to fetch PDF bytes via JS")?;
-            
+
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64.replace(['\n', '\r'], ""))
                 .context("Failed to decode base64 PDF data")?;
 
-            let (links, chunks) = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
-                let text = Extractor::extract_pdf_text(&bytes)?;
-                let mut chunks = MarkdownChunker::chunk(
-                    &text,
-                    &ChunkerOptions {
-                        max_size: 1000,
-                        ..Default::default()
-                    },
-                );
-                if chunks.len() > max_chunks {
-                    chunks.truncate(max_chunks);
-                }
-                // PDF link extraction could be added here later if needed
-                Ok((Vec::new(), chunks))
-            }).await.context("Blocking PDF extraction task panicked")??;
+            let (links, chunks) =
+                tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
+                    let text = Extractor::extract_pdf_text(&bytes)?;
+                    let mut chunks = MarkdownChunker::chunk(
+                        &text,
+                        &ChunkerOptions {
+                            max_size: 1000,
+                            ..Default::default()
+                        },
+                    );
+                    if chunks.len() > max_chunks {
+                        chunks.truncate(max_chunks);
+                    }
+                    // PDF link extraction could be added here later if needed
+                    Ok((Vec::new(), chunks))
+                })
+                .await
+                .context("Blocking PDF extraction task panicked")??;
 
             return Ok((title, links, chunks));
         }
 
         let content = page.content().await.context("Failed to get page content")?;
-        
+
         // Convert HTML → links + chunks in a blocking thread.
         // `content` is moved into the closure and freed after chunking — it never enters the bus.
         let url_owned = url.to_string();

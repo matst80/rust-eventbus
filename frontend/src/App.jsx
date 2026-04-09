@@ -6,6 +6,8 @@ import ReactMarkdown from 'react-markdown';
 function App() {
   const [crawlUrl, setCrawlUrl] = useState('');
   const [projectId, setProjectId] = useState('demo-project');
+  const [maxCrawls, setMaxCrawls] = useState(500);
+  const [maxChunks, setMaxChunks] = useState(50);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isCrawling, setIsCrawling] = useState(false);
@@ -38,7 +40,7 @@ function App() {
   };
 
   const crawlMutation = useMutation({
-    mutationFn: async ({ url, projectId }) => {
+    mutationFn: async ({ url, projectId, maxCrawls, maxChunks }) => {
       return new Promise((resolve, reject) => {
         setIsCrawling(true);
         setCrawlComplete(false);
@@ -47,10 +49,13 @@ function App() {
         logs.current = [];
         setDisplayLogs([]);
         
+        const sessionId = Math.random().toString(36).substring(2, 10);
         addLog(`[🚀] Starting crawl: ${url}`);
         addLog(`[📁] Project: ${projectId}`);
+        addLog(`[⚙️] Config: max_crawls=${maxCrawls}, max_chunks=${maxChunks}`);
+        addLog(`[🔖] Client Session: ${sessionId}`);
         
-        const eventSource = new EventSource(`/crawl?url=${encodeURIComponent(url)}&project_id=${encodeURIComponent(projectId)}`);
+        const eventSource = new EventSource(`/crawl?url=${encodeURIComponent(url)}&project_id=${encodeURIComponent(projectId)}&max_crawls=${maxCrawls}&max_chunks=${maxChunks}`);
 
         eventSource.onopen = () => {
           addLog(`[✓] Connected to event stream`);
@@ -62,7 +67,11 @@ function App() {
             
             if (data.type === 'progress') {
               setProgress(data);
-              addLog(`[📊] Progress: ${data.embedded_nodes}/${data.total_nodes} embedded • ${data.ingested_urls}/${data.requested_urls} URLs`);
+              if (data.session_id) {
+                addLog(`[📊] Progress (session: ${data.session_id.substring(0,8)}): ${data.embedded_nodes}/${data.total_nodes} embedded • ${data.ingested_urls}/${data.requested_urls} URLs`);
+              } else {
+                addLog(`[📊] Progress: ${data.embedded_nodes}/${data.total_nodes} embedded • ${data.ingested_urls}/${data.requested_urls} URLs`);
+              }
             } else if (data.Graph && data.Graph.NodeCreated) {
               const nodeId = data.Graph.NodeCreated.id;
               setCurrentChunk({ id: nodeId, metadata: data.Graph.NodeCreated.metadata });
@@ -110,7 +119,7 @@ function App() {
   const handleCrawl = (e) => {
     e.preventDefault();
     if (!crawlUrl.trim()) return;
-    crawlMutation.mutate({ url: crawlUrl, projectId });
+    crawlMutation.mutate({ url: crawlUrl, projectId, maxCrawls, maxChunks });
   };
 
   const handleSearch = (e) => {
@@ -187,6 +196,38 @@ function App() {
                 {isCrawling ? <Loader2 className="w-5 h-5 animate-spin" /> : 'Ingest'}
               </button>
             </form>
+          </div>
+
+          {/* Crawl Config */}
+          <div className="rounded-2xl bg-[#18181b]/80 backdrop-blur border border-[#27272a] p-4">
+            <div className="flex items-center gap-2 mb-3">
+              <Zap size={14} className="text-indigo-400" />
+              <span className="text-sm font-medium text-gray-300">Crawl Settings</span>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Max URLs</label>
+                <input
+                  type="number"
+                  value={maxCrawls}
+                  onChange={(e) => setMaxCrawls(Math.max(1, parseInt(e.target.value) || 500))}
+                  className="w-full bg-[#0a0a0f] border border-[#27272a] rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 outline-none"
+                  min="1"
+                  max="10000"
+                />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 block mb-1">Max Chunks</label>
+                <input
+                  type="number"
+                  value={maxChunks}
+                  onChange={(e) => setMaxChunks(Math.max(1, parseInt(e.target.value) || 50))}
+                  className="w-full bg-[#0a0a0f] border border-[#27272a] rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/50 outline-none"
+                  min="1"
+                  max="1000"
+                />
+              </div>
+            </div>
           </div>
 
           {/* Progress Card */}

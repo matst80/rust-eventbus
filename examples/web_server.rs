@@ -94,7 +94,7 @@ impl Default for AppConfig {
             crawl_timeout_secs: std::env::var("CRAWL_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(60),
+                .unwrap_or(120),
             db_max_connections: std::env::var("DB_MAX_CONNECTIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -127,7 +127,7 @@ struct AppState {
     embedding_service: Arc<OnnxEmbeddingService>,
     persistence: Arc<PersistenceService>,
     _crawler: Arc<CrawlerService>,
-    url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, Instant)>>>,
+    url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, Instant)>>>,
     sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>>,
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -171,6 +171,7 @@ async fn main() -> Result<()> {
         concurrency: config.crawler_concurrency,
         headless: true,
         max_chunks: config.max_chunks,
+        shutdown_flag: Some(Arc::clone(&shutdown_flag_clone)),
         ..Default::default()
     };
     let crawler = Arc::new(CrawlerService::new(Arc::clone(&bus), crawler_config));
@@ -224,8 +225,8 @@ async fn main() -> Result<()> {
     ));
     persistence.init_schema().await?;
 
-    // 6. Shared URL → (project_id, session_id) mapping with TTL-based cleanup
-    let url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, Instant)>>> =
+    // 6. Shared URL → (project_id, session_id, max_crawls, timestamp) mapping with TTL-based cleanup
+    let url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, Instant)>>> =
         Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let url_projects_cleanup = Arc::clone(&url_projects);
 
@@ -247,7 +248,7 @@ async fn main() -> Result<()> {
             let mut url_to_remove = Vec::new();
             {
                 let map = url_projects_cleanup.read();
-                for (url, (_, _, timestamp)) in map.iter() {
+                for (url, (_, _, _, timestamp)) in map.iter() {
                     if now.duration_since(*timestamp) > Duration::from_secs(300) {
                         url_to_remove.push(url.clone());
                     }
@@ -299,13 +300,15 @@ async fn main() -> Result<()> {
             Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let last_crawl: Arc<parking_lot::RwLock<HashMap<String, std::time::Instant>>> =
             Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let max_crawls_map: Arc<parking_lot::RwLock<HashMap<String, usize>>> =
+            Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         while let Ok(event) = pipeline_rx.recv().await {
             match &event.payload {
                 AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, .. }) => {
-                    let (project_id, session_id, _) =
+                    let (project_id, session_id, max_crawls, _) =
                         match pipeline_projects.read().get(url).cloned() {
-                            Some((pid, sid, ts)) => (pid, sid, ts),
+                            Some((pid, sid, max, ts)) => (pid, sid, max, ts),
                             None => continue,
                         };
 
@@ -313,30 +316,39 @@ async fn main() -> Result<()> {
                         let mut last_write = last_crawl.write();
                         let mut counts_write = requested_counts.write();
                         let mut visited_write = visited.write();
+                        let mut max_write = max_crawls_map.write();
 
                         let count = counts_write
-                            .get(&project_id)
+                            .get(&session_id)
                             .map(|c| c.load(Ordering::Relaxed))
                             .unwrap_or(0);
                         let visited_count =
-                            visited_write.get(&project_id).map(|v| v.len()).unwrap_or(0);
+                            visited_write.get(&session_id).map(|v| v.len()).unwrap_or(0);
 
-                        let last_time = last_write.get(&project_id).cloned();
+                        let max_crawls_for_session = max_crawls;
+
+                        // Store max_crawls for this session
+                        max_write.insert(session_id.clone(), max_crawls);
+
+                        let last_time = last_write.get(&session_id).cloned();
                         let should_reset = match last_time {
                             Some(instant) => {
                                 instant.elapsed().as_secs() > config_clone.session_timeout_secs
-                                    || count >= config_clone.max_crawls
+                                    || count >= max_crawls_for_session
                                     || visited_count == 0
                             }
                             None => true,
                         };
 
                         if should_reset {
-                            info!("Starting new crawl session for project: {}", project_id);
-                            counts_write.remove(&project_id);
-                            visited_write.remove(&project_id);
+                            info!(
+                                "Starting new crawl session for project: {} session: {} (max: {})",
+                                project_id, session_id, max_crawls_for_session
+                            );
+                            counts_write.remove(&session_id);
+                            visited_write.remove(&session_id);
                         }
-                        last_write.insert(project_id, std::time::Instant::now());
+                        last_write.insert(session_id.clone(), std::time::Instant::now());
 
                         should_reset
                     };
@@ -347,13 +359,16 @@ async fn main() -> Result<()> {
                     links,
                     chunks,
                 }) => {
-                    let (project_id, session_id, _) =
+                    let (project_id, session_id, max_crawls, _) =
                         match pipeline_projects.read().get(url).cloned() {
-                            Some((pid, sid, ts)) => (pid, sid, ts),
+                            Some((pid, sid, max, ts)) => (pid, sid, max, ts),
                             None => continue,
                         };
 
-                    info!("Pipeline: storing page {} (project {})", url, project_id);
+                    info!(
+                        "Pipeline: storing page {} (project {}, session {}, max: {})",
+                        url, project_id, session_id, max_crawls
+                    );
 
                     // Upsert page
                     if let Err(e) = pipeline_persistence
@@ -371,6 +386,13 @@ async fn main() -> Result<()> {
                     let mut links_to_insert = Vec::new();
                     let mut urls_to_crawl = Vec::new();
 
+                    // Get the max_crawls limit for this session
+                    let max_crawls_limit = max_crawls_map
+                        .read()
+                        .get(&session_id)
+                        .copied()
+                        .unwrap_or(max_crawls);
+
                     for target in links {
                         let mut target_url = match Url::parse(target) {
                             Ok(u) => u,
@@ -380,11 +402,11 @@ async fn main() -> Result<()> {
                         target_url.set_fragment(None);
                         let normalized = target_url.to_string();
 
-                        // Check per-project visited set
+                        // Check per-session visited set
                         let is_visited = {
                             let visited = visited.read();
                             visited
-                                .get(&project_id)
+                                .get(&session_id)
                                 .map(|v| v.contains(&normalized))
                                 .unwrap_or(false)
                         };
@@ -396,10 +418,10 @@ async fn main() -> Result<()> {
                         let is_same_domain =
                             target_domain.is_some() && target_domain == start_domain.as_deref();
 
-                        // Get or create per-project counter
+                        // Get or create per-session counter
                         let count = {
                             let counts = requested_counts.read();
-                            counts.get(&project_id).cloned()
+                            counts.get(&session_id).cloned()
                         };
                         let count = match count {
                             Some(c) => c,
@@ -407,31 +429,69 @@ async fn main() -> Result<()> {
                                 let c = Arc::new(AtomicUsize::new(0));
                                 requested_counts
                                     .write()
-                                    .insert(project_id.clone(), Arc::clone(&c));
+                                    .insert(session_id.clone(), Arc::clone(&c));
+                                c
+                            }
+                        };
+                        target_url.set_query(None);
+                        target_url.set_fragment(None);
+                        let normalized = target_url.to_string();
+
+                        // Check per-session visited set
+                        let is_visited = {
+                            let visited = visited.read();
+                            visited
+                                .get(&session_id)
+                                .map(|v| v.contains(&normalized))
+                                .unwrap_or(false)
+                        };
+                        if is_visited {
+                            continue;
+                        }
+
+                        let target_domain = target_url.domain();
+                        let is_same_domain =
+                            target_domain.is_some() && target_domain == start_domain.as_deref();
+
+                        // Get or create per-session counter
+                        let count = {
+                            let counts = requested_counts.read();
+                            counts.get(&session_id).cloned()
+                        };
+                        let count = match count {
+                            Some(c) => c,
+                            None => {
+                                let c = Arc::new(AtomicUsize::new(0));
+                                requested_counts
+                                    .write()
+                                    .insert(session_id.clone(), Arc::clone(&c));
                                 c
                             }
                         };
 
-                        if !is_same_domain
-                            || count.load(Ordering::Relaxed) >= config_clone.max_crawls
-                        {
+                        if !is_same_domain || count.load(Ordering::Relaxed) >= max_crawls_limit {
                             continue;
                         }
 
-                        // Mark as visited for this project
+                        // Mark as visited for this session
                         {
                             let mut visited = visited.write();
                             visited
-                                .entry(project_id.clone())
+                                .entry(session_id.clone())
                                 .or_insert_with(HashSet::new)
                                 .insert(normalized.clone());
                         }
                         count.fetch_add(1, Ordering::Relaxed);
 
-                        // Track project for discovered URL with timestamp
+                        // Track project for discovered URL with timestamp and max_crawls
                         pipeline_projects.write().insert(
                             normalized.clone(),
-                            (project_id.clone(), session_id.clone(), Instant::now()),
+                            (
+                                project_id.clone(),
+                                session_id.clone(),
+                                max_crawls,
+                                Instant::now(),
+                            ),
                         );
 
                         // Queue link for batch insert
@@ -592,13 +652,14 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let project_id = match pipeline_projects.read().get(page_url).cloned() {
-                        Some((pid, _, _)) => pid,
-                        None => {
-                            tracing::warn!("No project_id found for page_url: {}", page_url);
-                            continue;
-                        }
-                    };
+                    let (project_id, _, _, _) =
+                        match pipeline_projects.read().get(page_url).cloned() {
+                            Some(data) => data,
+                            None => {
+                                tracing::warn!("No project_id found for page_url: {}", page_url);
+                                continue;
+                            }
+                        };
                     tracing::debug!("Updating embedding for id: {} project: {}", id, project_id);
 
                     // Batch update embedding
@@ -664,6 +725,7 @@ fn make_progress(
     embedded: &HashSet<String>,
     ing: &HashSet<String>,
     req: &HashSet<String>,
+    failed: &HashSet<String>,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "progress",
@@ -671,7 +733,8 @@ fn make_progress(
         "total_nodes": pending.len() + embedded.len(),
         "embedded_nodes": embedded.len(),
         "ingested_urls": ing.len(),
-        "requested_urls": req.len()
+        "requested_urls": req.len(),
+        "failed_urls": failed.len()
     })
 }
 
@@ -738,7 +801,12 @@ async fn crawl_handler(
 
     state.url_projects.write().insert(
         (*url).clone(),
-        (project_id, session_id.clone(), Instant::now()),
+        (
+            project_id,
+            session_id.clone(),
+            params.max_crawls,
+            Instant::now(),
+        ),
     );
 
     // Kick off the crawl AFTER registering the mapping
@@ -763,10 +831,12 @@ async fn crawl_handler(
     let ingested_urls = HashSet::new();
     let pending_chunks = HashSet::new();
     let embedded_chunks = HashSet::new();
+    let failed_urls = HashSet::new();
     let last_activity = std::time::Instant::now();
     let idle_count = 0;
     let state_clone = Arc::clone(&state);
     let config_for_sse = AppConfig::default();
+    let max_crawls_limit = params.max_crawls;
 
     let stream = stream::unfold(
         (
@@ -778,9 +848,11 @@ async fn crawl_handler(
             ingested_urls,
             pending_chunks,
             embedded_chunks,
+            failed_urls,
             last_activity,
             idle_count,
             state_clone,
+            max_crawls_limit,
         ),
         move |(
             mut rx,
@@ -791,17 +863,26 @@ async fn crawl_handler(
             mut ing,
             mut pending_chunks,
             mut embedded_chunks,
+            mut failed,
             mut last,
             mut idle_count,
             state_clone,
+            max_crawls,
         )| async move {
             loop {
                 // Track progress
                 let total_chunks = pending_chunks.len() + embedded_chunks.len();
                 let embedded_count = embedded_chunks.len();
+                let requested_count = req.len();
 
-                // Completion: no pending chunks and we've been idle for a bit
-                let is_complete = pending_chunks.is_empty() && !req.is_empty() && idle_count >= 2;
+                // Only check for completion after we've had at least one activity
+                // and no pending chunks remain
+                // Complete if: reached max_crawls OR (has progress, no pending chunks, and idle)
+                let has_started = !ing.is_empty() || embedded_count > 0;
+                let total_processed = requested_count + failed.len();
+                let reached_max = total_processed >= max_crawls;
+                let is_complete =
+                    reached_max || (pending_chunks.is_empty() && has_started && idle_count >= 2);
 
                 // After completion is sent, end the stream
                 if is_complete && idle_count >= 3 {
@@ -817,7 +898,7 @@ async fn crawl_handler(
                     let mut urls_to_remove = Vec::new();
                     {
                         let map = state_clone.url_projects.read();
-                        for (url, (_, sid, _)) in map.iter() {
+                        for (url, (_, sid, _, _)) in map.iter() {
                             if sid == &session_id {
                                 urls_to_remove.push(url.clone());
                             }
@@ -835,13 +916,19 @@ async fn crawl_handler(
 
                 if is_complete {
                     info!(
-                        "Crawl session completed for: {} ({} chunks)",
-                        url_arc, embedded_count
+                        "Crawl session completed for: {} ({} chunks, requested: {})",
+                        url_arc, embedded_count, requested_count
                     );
                     // Send final progress and increment idle to signal we're done
                     idle_count += 1;
-                    let progress_json =
-                        make_progress(&session_id, &pending_chunks, &embedded_chunks, &ing, &req);
+                    let progress_json = make_progress(
+                        &session_id,
+                        &pending_chunks,
+                        &embedded_chunks,
+                        &ing,
+                        &req,
+                        &failed,
+                    );
                     return Some((
                         Ok(SseEvent::default().data(progress_json.to_string())),
                         (
@@ -853,19 +940,33 @@ async fn crawl_handler(
                             ing,
                             pending_chunks,
                             embedded_chunks,
+                            failed,
                             last,
                             idle_count,
                             state_clone,
+                            max_crawls,
                         ),
                     ));
                 }
 
                 // Timeout check using configurable timeout
-                let has_activity = !req.is_empty() || !ing.is_empty() || total_chunks > 0;
-                if has_activity && last.elapsed().as_secs() > config_for_sse.crawl_timeout_secs {
-                    info!("Crawl session timed out for: {}", url_arc);
-                    let progress_json =
-                        make_progress(&session_id, &pending_chunks, &embedded_chunks, &ing, &req);
+                // Only timeout if we've actually had some activity and been waiting too long
+                let has_progress = !ing.is_empty() || embedded_count > 0;
+                if has_progress && last.elapsed().as_secs() > config_for_sse.crawl_timeout_secs {
+                    info!(
+                        "Crawl session timed out for: {} (ing: {}, embedded: {})",
+                        url_arc,
+                        ing.len(),
+                        embedded_count
+                    );
+                    let progress_json = make_progress(
+                        &session_id,
+                        &pending_chunks,
+                        &embedded_chunks,
+                        &ing,
+                        &req,
+                        &failed,
+                    );
                     return Some((
                         Ok(SseEvent::default().data(progress_json.to_string())),
                         (
@@ -877,9 +978,11 @@ async fn crawl_handler(
                             ing,
                             pending_chunks,
                             embedded_chunks,
+                            failed,
                             last,
                             idle_count,
                             state_clone,
+                            max_crawls,
                         ),
                     ));
                 }
@@ -922,6 +1025,7 @@ async fn crawl_handler(
                                         &embedded_chunks,
                                         &ing,
                                         &req,
+                                        &failed,
                                     );
                                     return Some((
                                         Ok(SseEvent::default().data(progress_json.to_string())),
@@ -934,9 +1038,11 @@ async fn crawl_handler(
                                             ing,
                                             pending_chunks,
                                             embedded_chunks,
+                                            failed,
                                             last,
                                             idle_count,
                                             state_clone,
+                                            max_crawls,
                                         ),
                                     ));
                                 }
@@ -958,6 +1064,7 @@ async fn crawl_handler(
                                     &embedded_chunks,
                                     &ing,
                                     &req,
+                                    &failed,
                                 );
                                 return Some((
                                     Ok(SseEvent::default().data(progress_json.to_string())),
@@ -970,9 +1077,11 @@ async fn crawl_handler(
                                         ing,
                                         pending_chunks,
                                         embedded_chunks,
+                                        failed,
                                         last,
                                         idle_count,
                                         state_clone,
+                                        max_crawls,
                                     ),
                                 ));
                             }
@@ -995,6 +1104,7 @@ async fn crawl_handler(
                                     &embedded_chunks,
                                     &ing,
                                     &req,
+                                    &failed,
                                 );
                                 return Some((
                                     Ok(SseEvent::default().data(progress_json.to_string())),
@@ -1007,11 +1117,21 @@ async fn crawl_handler(
                                         ing,
                                         pending_chunks,
                                         embedded_chunks,
+                                        failed,
                                         last,
                                         idle_count,
                                         state_clone,
+                                        max_crawls,
                                     ),
                                 ));
+                            }
+                        }
+                        AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, .. }) => {
+                            if req.contains(&url) {
+                                if failed.insert(url.clone()) {
+                                    last = std::time::Instant::now();
+                                    idle_count = 0;
+                                }
                             }
                         }
                         _ => {}
