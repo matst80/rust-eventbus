@@ -12,8 +12,15 @@ WORKDIR /usr/src/app
 
 # Docker caching: Copy only dependency files first
 COPY Cargo.toml Cargo.lock ./
-# Create a dummy src/lib.rs to allow cargo to fetch dependencies
-RUN mkdir src && echo "pub fn dummy() {}" > src/lib.rs
+
+# Create dummy files for all targets defined in Cargo.toml to allow dependency fetching
+RUN mkdir -p src benches examples \
+    && echo "pub fn dummy() {}" > src/lib.rs \
+    && touch benches/eventbus_bench.rs \
+    && touch benches/store_bench.rs \
+    && touch benches/embedding_bench.rs \
+    && echo "fn main() {}" > examples/web_server.rs
+
 # Fetch dependencies (this layer will be cached)
 RUN cargo fetch
 
