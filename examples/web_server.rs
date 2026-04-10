@@ -114,10 +114,10 @@ struct AppState {
     bus: Arc<EventBus<AppEvent>>,
     embedding_service: Arc<OnnxEmbeddingService>,
     persistence: Arc<PersistenceService>,
-    _crawler: Arc<CrawlerService>,
     url_projects:
         Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, usize, Instant)>>>,
     sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>>,
+    shutdown_flag: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -164,19 +164,11 @@ async fn main() -> Result<()> {
     };
     let crawler = Arc::new(CrawlerService::new(Arc::clone(&bus), crawler_config));
     let crawler_clone = Arc::clone(&crawler);
-    let shutdown_flag_worker = Arc::clone(&shutdown_flag_clone);
+    let _shutdown_flag_worker = Arc::clone(&shutdown_flag_clone);
     tokio::spawn(async move {
-        tokio::select! {
-            result = crawler_clone.run() => {
-                if let Err(e) = result {
-                    tracing::error!("Crawler service failed: {}", e);
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Crawler shutdown signal received");
-            }
+        if let Err(e) = crawler_clone.run().await {
+            tracing::error!("Crawler service failed: {}", e);
         }
-        shutdown_flag_worker.store(true, Ordering::SeqCst);
     });
 
     // 5. Embedding service
@@ -640,9 +632,9 @@ async fn main() -> Result<()> {
         bus,
         embedding_service,
         persistence,
-        _crawler: crawler,
         url_projects,
         sessions,
+        shutdown_flag: Arc::clone(&shutdown_flag),
     });
 
     let app = Router::new()
@@ -652,19 +644,25 @@ async fn main() -> Result<()> {
         .route("/search", post(search_handler))
         .with_state(state);
 
-    // Graceful shutdown handler
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
-        info!("Shutdown signal received");
-        shutdown_flag_clone.store(true, Ordering::SeqCst);
-    });
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3010").await?;
-    info!("Listening on http://0.0.0.0:3010");
-    axum::serve(listener, app).await?;
+    let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("{}:{}", host, port);
 
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!("Listening on http://{}", addr);
+    
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to listen for Ctrl+C");
+            info!("Shutdown signal received, stopping server...");
+            shutdown_flag_clone.store(true, Ordering::SeqCst);
+        })
+        .await?;
+
+    info!("Web server stopped cleanly");
     Ok(())
 }
 
@@ -793,6 +791,7 @@ async fn crawl_handler(
     let config_for_sse = AppConfig::default();
     let max_crawls_limit = params.max_crawls;
 
+    let shutdown_flag_sse = Arc::clone(&state_clone.shutdown_flag);
     let stream = stream::unfold(
         (
             bus_rx,
@@ -808,6 +807,7 @@ async fn crawl_handler(
             idle_count,
             state_clone,
             max_crawls_limit,
+            shutdown_flag_sse,
         ),
         move |(
             mut rx,
@@ -823,8 +823,15 @@ async fn crawl_handler(
             mut idle_count,
             state_clone,
             max_crawls,
+            shutdown_flag,
         )| async move {
             loop {
+                // Check if server is shutting down
+                if shutdown_flag.load(Ordering::SeqCst) {
+                    info!("SSE stream: server shutting down, ending session {}", session_id);
+                    return None;
+                }
+
                 // Track progress
                 let embedded_count = embedded_chunks.len();
                 let requested_count = req.len();
@@ -899,6 +906,7 @@ async fn crawl_handler(
                             idle_count,
                             state_clone,
                             max_crawls,
+                            shutdown_flag,
                         ),
                     ));
                 }
@@ -937,6 +945,7 @@ async fn crawl_handler(
                             idle_count,
                             state_clone,
                             max_crawls,
+                            shutdown_flag,
                         ),
                     ));
                 }
@@ -997,6 +1006,7 @@ async fn crawl_handler(
                                             idle_count,
                                             state_clone,
                                             max_crawls,
+                                shutdown_flag,
                                         ),
                                     ));
                                 }
@@ -1036,6 +1046,7 @@ async fn crawl_handler(
                                         idle_count,
                                         state_clone,
                                         max_crawls,
+                                        shutdown_flag,
                                     ),
                                 ));
                             }
@@ -1076,6 +1087,7 @@ async fn crawl_handler(
                                         idle_count,
                                         state_clone,
                                         max_crawls,
+                                shutdown_flag,
                                     ),
                                 ));
                             }

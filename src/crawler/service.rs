@@ -146,7 +146,7 @@ impl CrawlerService {
         });
 
         // --- Internal Task Queue ---
-        let (tx, rx_internal) = mpsc::channel::<Event<AppEvent>>(100);
+        let (tx, rx_internal) = mpsc::unbounded_channel::<Event<AppEvent>>();
         let shared_rx = Arc::new(tokio::sync::Mutex::new(rx_internal));
 
         // Spawn Runner Workers
@@ -243,20 +243,32 @@ impl CrawlerService {
 
         let mut rx = self.bus.subscribe();
         loop {
-            tokio::select! {
-                Ok(event) = rx.recv() => {
-                    // Check shutdown flag
-                    if let Some(ref flag) = shutdown_flag {
-                        if flag.load(Ordering::SeqCst) {
-                            info!("Shutdown flag set - stopping crawler");
-                            break;
-                        }
-                    }
+            // Check shutdown flag at the start of each iteration
+            if let Some(ref flag) = shutdown_flag {
+                if flag.load(Ordering::SeqCst) {
+                    info!("Shutdown flag set - stopping crawler loop");
+                    break;
+                }
+            }
 
-                    if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { .. }) = &event.payload {
-                        // Queue the task
-                        if let Err(e) = tx.send(event).await {
-                            error!("Failed to queue crawl task: {:?}", e);
+            tokio::select! {
+                res = rx.recv() => {
+                    match res {
+                        Ok(event) => {
+                            if let AppEvent::Crawler(CrawlerEvent::CrawlRequested { .. }) = &event.payload {
+                                // Queue the task
+                                if let Err(e) = tx.send(event) {
+                                    error!("Failed to queue crawl task: {}", e);
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            error!("Crawler service missed {} events from the bus (lagged)", n);
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            info!("Event bus channel closed, stopping crawler");
+                            break;
                         }
                     }
                 }
@@ -264,7 +276,6 @@ impl CrawlerService {
                     error!("Browser handler task exited unexpectedly.");
                     break;
                 }
-                else => break,
             }
         }
 
@@ -329,13 +340,16 @@ impl CrawlerService {
             let b64_script = r#"
                 (async () => {
                     const resp = await fetch(window.location.href);
-                    const buf = await resp.arrayBuffer();
-                    const bytes = new Uint8Array(buf);
-                    let binary = '';
-                    for (let i = 0; i < bytes.byteLength; i++) {
-                        binary += String.fromCharCode(bytes[i]);
-                    }
-                    return btoa(binary);
+                    const blob = await resp.blob();
+                    return new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                            const base64data = reader.result.split(',')[1];
+                            resolve(base64data);
+                        };
+                        reader.onerror = reject;
+                        reader.readAsDataURL(blob);
+                    });
                 })()
             "#;
 
@@ -352,7 +366,7 @@ impl CrawlerService {
 
             let (links, chunks) =
                 tokio::task::spawn_blocking(move || -> Result<(Vec<String>, Vec<Chunk>)> {
-                    let text = Extractor::extract_pdf_text(&bytes)?;
+                    let text = Extractor::extract_pdf_text(&bytes)?.replace('\0', "");
                     let mut chunks = MarkdownChunker::chunk(
                         &text,
                         &ChunkerOptions {

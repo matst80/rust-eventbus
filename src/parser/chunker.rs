@@ -155,7 +155,11 @@ impl MarkdownChunker {
 
             // If a single atom is STILL too large, split it by characters
             while current_content.len() > options.max_size {
-                let split_search_len = options.max_size.min(current_content.len());
+                let mut split_search_len = options.max_size.min(current_content.len());
+                while !current_content.is_char_boundary(split_search_len) {
+                    split_search_len -= 1;
+                }
+
                 let mut is_blank_line = false;
                 let split_idx = if let Some(idx) = current_content[..split_search_len].rfind("\n\n") {
                     is_blank_line = true;
@@ -165,12 +169,7 @@ impl MarkdownChunker {
                 } else if let Some(idx) = current_content[..split_search_len].rfind(' ') {
                     idx
                 } else {
-                    current_content
-                        .char_indices()
-                        .map(|(i, _)| i)
-                        .filter(|&i| i <= options.max_size)
-                        .last()
-                        .unwrap_or(options.max_size)
+                    split_search_len
                 };
 
                 let split_idx = if split_idx == 0 {
@@ -336,5 +335,23 @@ Content of section 1
         let chunks = MarkdownChunker::chunk(markdown, &options);
         // Overlap should be "and stuff." (10 chars roughly)
         assert!(chunks[1].content.contains("and stuff."));
+    }
+    #[test]
+    fn test_char_boundary_panic() {
+        // 'å' is 2 bytes: C3 A5
+        // Generate a string where 'å' spans the max_size boundary
+        let mut text = "a".repeat(999);
+        text.push('å'); // bytes 999 and 1000
+        text.push_str(" extra content");
+        
+        let options = ChunkerOptions {
+            max_size: 1000,
+            min_size: 10,
+            overlap: 0,
+        };
+        
+        // This should not panic
+        let chunks = MarkdownChunker::chunk(&text, &options);
+        assert!(!chunks.is_empty());
     }
 }

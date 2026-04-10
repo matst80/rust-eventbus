@@ -15,7 +15,8 @@ impl Extractor {
         let mut page_numbers: Vec<u32> = pages.keys().cloned().collect();
         page_numbers.sort_unstable();
         
-        doc.extract_text(&page_numbers).context("Failed to extract text from PDF")
+        let text = doc.extract_text(&page_numbers).context("Failed to extract text from PDF")?;
+        Ok(text.replace('\0', ""))
     }
 
     /// Extracts absolute links from the HTML content.
@@ -190,7 +191,10 @@ impl Extractor {
         let raw_markdown = html2md::parse_html(&processed_html);
 
         // Post-process the markdown
-        Self::clean_markdown(&raw_markdown, base_url)
+        let markdown = Self::clean_markdown(&raw_markdown, base_url);
+        
+        // Strip null bytes for DB safety
+        markdown.replace('\0', "")
     }
 
     /// Strips most images, keeping only the first eager-loaded one as a hero candidate.
