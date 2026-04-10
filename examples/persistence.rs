@@ -19,11 +19,14 @@ pub struct SearchResult {
 
 pub struct PersistenceService {
     pool: Arc<PgPool>,
-    embed_fn: Arc<dyn Fn(&str) -> Vec<f32> + Send + Sync>,
+    embed_fn: Arc<dyn Fn(&str) -> Result<Vec<f32>> + Send + Sync>,
 }
 
 impl PersistenceService {
-    pub fn new(pool: Arc<PgPool>, embed_fn: Arc<dyn Fn(&str) -> Vec<f32> + Send + Sync>) -> Self {
+    pub fn new(
+        pool: Arc<PgPool>,
+        embed_fn: Arc<dyn Fn(&str) -> Result<Vec<f32>> + Send + Sync>,
+    ) -> Self {
         Self { pool, embed_fn }
     }
 
@@ -171,39 +174,34 @@ impl PersistenceService {
         Ok(())
     }
 
-    pub async fn update_embeddings_batch(
+    pub async fn update_embedding(
         &self,
-        embeddings: Vec<(String, String, Vec<f32>)>,
+        id: &str,
+        project_id: &str,
+        embedding: Vec<f32>,
     ) -> Result<()> {
-        if embeddings.is_empty() {
-            return Ok(());
-        }
-
-        for (id, project_id, embedding) in embeddings {
-            let vec = Vector::from(embedding);
-            sqlx::query("UPDATE bge_chunks SET embedding = $1 WHERE id = $2 AND project_id = $3")
-                .bind(vec)
-                .bind(id)
-                .bind(project_id)
-                .execute(&*self.pool)
-                .await?;
-        }
+        let vec = Vector::from(embedding);
+        sqlx::query("UPDATE bge_chunks SET embedding = $1 WHERE id = $2 AND project_id = $3")
+            .bind(vec)
+            .bind(id)
+            .bind(project_id)
+            .execute(&*self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn search(&self, query: &str, project_id: &str) -> Result<Vec<SearchResult>> {
         tracing::debug!("Searching for '{}' in project '{}'", query, project_id);
 
-        // Get query embedding
-        let raw_vec = (self.embed_fn)(query);
+        let embed_fn = Arc::clone(&self.embed_fn);
+        let query_owned = query.to_string();
+        let raw_vec = tokio::task::spawn_blocking(move || embed_fn(&query_owned))
+            .await
+            .map_err(|e| anyhow::anyhow!("Query embedding task failed: {}", e))??;
         tracing::debug!("Query embedding length: {}", raw_vec.len());
 
         if raw_vec.is_empty() {
-            tracing::warn!(
-                "Query embedding returned empty vector, falling back to text search only"
-            );
-            // Fall back to text-only search if embedding fails
-            return self.search_text_only(query, project_id).await;
+            return Err(anyhow::anyhow!("Query embedding returned an empty vector"));
         }
 
         let query_vec = Vector::from(raw_vec);
@@ -243,57 +241,6 @@ impl PersistenceService {
                     vector_score,
                     text_score,
                     score: vector_score * 0.7 + text_score * 0.3,
-                    id: row.get("id"),
-                    page_url: row.get("page_url"),
-                    title: row.get("title"),
-                    section: row.get("section"),
-                    content: row.get("content"),
-                    chunk_index: row.get("chunk_index"),
-                }
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    async fn search_text_only(&self, query: &str, project_id: &str) -> Result<Vec<SearchResult>> {
-        tracing::debug!(
-            "Using text-only search for '{}' in project '{}'",
-            query,
-            project_id
-        );
-
-        let rows = sqlx::query(
-            "SELECT
-                c.id,
-                c.page_url,
-                COALESCE(p.title, c.page_url) AS title,
-                COALESCE(c.section, '') AS section,
-                c.content,
-                c.chunk_index,
-                0.0 AS vector_score,
-                ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1)) AS text_score
-            FROM bge_chunks c
-            JOIN bge_pages p ON c.page_url = p.url AND c.project_id = p.project_id
-            WHERE c.project_id = $2
-            ORDER BY
-                ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1))
-                DESC
-            LIMIT 20",
-        )
-        .bind(query)
-        .bind(project_id)
-        .fetch_all(&*self.pool)
-        .await?;
-
-        let results = rows
-            .iter()
-            .map(|row| {
-                let text_score: f32 = row.get("text_score");
-                SearchResult {
-                    vector_score: 0.0,
-                    text_score,
-                    score: text_score,
                     id: row.get("id"),
                     page_url: row.get("page_url"),
                     title: row.get("title"),

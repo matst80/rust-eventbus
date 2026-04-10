@@ -11,6 +11,8 @@ pub enum CrawlerEvent {
         url: String,
         /// Optional selector to wait for (for SPAs)
         wait_selector: Option<String>,
+        /// Optional per-request chunk limit override.
+        max_chunks: Option<usize>,
     },
     /// Emitted when a page has been successfully crawled and pre-processed.
     /// The raw HTML is converted to chunks and links inside the crawler before publishing,

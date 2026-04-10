@@ -67,7 +67,6 @@ struct SearchRequest {
 
 #[derive(Debug, Clone)]
 struct AppConfig {
-    max_crawls: usize,
     max_chunks: usize,
     session_timeout_secs: u64,
     crawl_timeout_secs: u64,
@@ -79,10 +78,6 @@ struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            max_crawls: std::env::var("MAX_CRAWLS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500),
             max_chunks: std::env::var("MAX_CHUNKS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -112,13 +107,6 @@ impl Default for AppConfig {
 }
 
 struct SessionState {
-    session_id: String,
-    project_id: String,
-    start_domain: Option<String>,
-    max_crawls: usize,
-    requested: HashSet<String>,
-    visited: HashSet<String>,
-    counts: Arc<AtomicUsize>,
     last_crawl: Instant,
 }
 
@@ -127,9 +115,9 @@ struct AppState {
     embedding_service: Arc<OnnxEmbeddingService>,
     persistence: Arc<PersistenceService>,
     _crawler: Arc<CrawlerService>,
-    url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, Instant)>>>,
+    url_projects:
+        Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, usize, Instant)>>>,
     sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>>,
-    shutdown_flag: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -210,24 +198,18 @@ async fn main() -> Result<()> {
     // 2. Persistence service
     let persistence = Arc::new(PersistenceService::new(
         Arc::new(db.clone()),
-        Arc::new(
-            move |text: &str| match embedding_service_for_persistence.embed(text) {
-                Ok(emb) => {
-                    tracing::debug!("Generated embedding of length {}", emb.len());
-                    emb
-                }
-                Err(e) => {
-                    tracing::error!("Failed to embed query: {}", e);
-                    vec![]
-                }
-            },
-        ),
+        Arc::new(move |text: &str| {
+            let emb = embedding_service_for_persistence.embed(text)?;
+            tracing::debug!("Generated embedding of length {}", emb.len());
+            Ok(emb)
+        }),
     ));
     persistence.init_schema().await?;
 
-    // 6. Shared URL → (project_id, session_id, max_crawls, timestamp) mapping with TTL-based cleanup
-    let url_projects: Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    // 6. Shared URL → (project_id, session_id, max_crawls, max_chunks, timestamp) mapping
+    let url_projects: Arc<
+        parking_lot::RwLock<HashMap<String, (String, String, usize, usize, Instant)>>,
+    > = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let url_projects_cleanup = Arc::clone(&url_projects);
 
     // Sessions map for per-session state isolation
@@ -248,7 +230,7 @@ async fn main() -> Result<()> {
             let mut url_to_remove = Vec::new();
             {
                 let map = url_projects_cleanup.read();
-                for (url, (_, _, _, timestamp)) in map.iter() {
+                for (url, (_, _, _, _, timestamp)) in map.iter() {
                     if now.duration_since(*timestamp) > Duration::from_secs(300) {
                         url_to_remove.push(url.clone());
                     }
@@ -306,9 +288,11 @@ async fn main() -> Result<()> {
         while let Ok(event) = pipeline_rx.recv().await {
             match &event.payload {
                 AppEvent::Crawler(CrawlerEvent::CrawlRequested { url, .. }) => {
-                    let (project_id, session_id, max_crawls, _) =
+                    let (project_id, session_id, max_crawls, _, _) =
                         match pipeline_projects.read().get(url).cloned() {
-                            Some((pid, sid, max, ts)) => (pid, sid, max, ts),
+                            Some((pid, sid, max, max_chunks, ts)) => {
+                                (pid, sid, max, max_chunks, ts)
+                            }
                             None => continue,
                         };
 
@@ -359,9 +343,11 @@ async fn main() -> Result<()> {
                     links,
                     chunks,
                 }) => {
-                    let (project_id, session_id, max_crawls, _) =
+                    let (project_id, session_id, max_crawls, max_chunks, _) =
                         match pipeline_projects.read().get(url).cloned() {
-                            Some((pid, sid, max, ts)) => (pid, sid, max, ts),
+                            Some((pid, sid, max, max_chunks, ts)) => {
+                                (pid, sid, max, max_chunks, ts)
+                            }
                             None => continue,
                         };
 
@@ -433,41 +419,6 @@ async fn main() -> Result<()> {
                                 c
                             }
                         };
-                        target_url.set_query(None);
-                        target_url.set_fragment(None);
-                        let normalized = target_url.to_string();
-
-                        // Check per-session visited set
-                        let is_visited = {
-                            let visited = visited.read();
-                            visited
-                                .get(&session_id)
-                                .map(|v| v.contains(&normalized))
-                                .unwrap_or(false)
-                        };
-                        if is_visited {
-                            continue;
-                        }
-
-                        let target_domain = target_url.domain();
-                        let is_same_domain =
-                            target_domain.is_some() && target_domain == start_domain.as_deref();
-
-                        // Get or create per-session counter
-                        let count = {
-                            let counts = requested_counts.read();
-                            counts.get(&session_id).cloned()
-                        };
-                        let count = match count {
-                            Some(c) => c,
-                            None => {
-                                let c = Arc::new(AtomicUsize::new(0));
-                                requested_counts
-                                    .write()
-                                    .insert(session_id.clone(), Arc::clone(&c));
-                                c
-                            }
-                        };
 
                         if !is_same_domain || count.load(Ordering::Relaxed) >= max_crawls_limit {
                             continue;
@@ -490,6 +441,7 @@ async fn main() -> Result<()> {
                                 project_id.clone(),
                                 session_id.clone(),
                                 max_crawls,
+                                max_chunks,
                                 Instant::now(),
                             ),
                         );
@@ -630,6 +582,7 @@ async fn main() -> Result<()> {
                             AppEvent::Crawler(CrawlerEvent::CrawlRequested {
                                 url: normalized,
                                 wait_selector: None,
+                                max_chunks: Some(max_chunks),
                             }),
                         )) {
                             warn!("Failed to publish CrawlRequested: {}", e);
@@ -652,7 +605,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let (project_id, _, _, _) =
+                    let (project_id, _, _, _, _) =
                         match pipeline_projects.read().get(page_url).cloned() {
                             Some(data) => data,
                             None => {
@@ -666,14 +619,13 @@ async fn main() -> Result<()> {
                     let persist = Arc::clone(&pipeline_persistence);
                     let sem = Arc::clone(&batch_semaphore_clone);
                     let id_clone = id.clone();
-                    let embed_clone = embedding.to_vec();
+                    let embed_clone = embedding.clone();
                     tokio::spawn(async move {
                         let _permit = sem.acquire().await;
-                        if let Err(e) = persist
-                            .update_embeddings_batch(vec![(id_clone, project_id, embed_clone)])
-                            .await
+                        if let Err(e) =
+                            persist.update_embedding(&id_clone, &project_id, embed_clone).await
                         {
-                            tracing::error!("Failed to update embeddings batch: {}", e);
+                            tracing::error!("Failed to update embedding: {}", e);
                         }
                     });
                 }
@@ -691,7 +643,6 @@ async fn main() -> Result<()> {
         _crawler: crawler,
         url_projects,
         sessions,
-        shutdown_flag,
     });
 
     let app = Router::new()
@@ -760,9 +711,19 @@ async fn embeddings_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<EmbeddingRequest>,
 ) -> impl IntoResponse {
-    match state.embedding_service.embed(&payload.text) {
-        Ok(embedding) => Json(EmbeddingResponse { embedding }).into_response(),
-        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    let embedding_service = Arc::clone(&state.embedding_service);
+    let text = payload.text;
+
+    match tokio::task::spawn_blocking(move || embedding_service.embed(&text)).await {
+        Ok(Ok(embedding)) => Json(EmbeddingResponse { embedding }).into_response(),
+        Ok(Err(e)) => {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Embedding task failed: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -784,13 +745,6 @@ async fn crawl_handler(
     );
 
     let session_state = SessionState {
-        session_id: session_id.clone(),
-        project_id: project_id.clone(),
-        start_domain: start_domain.clone(),
-        max_crawls: params.max_crawls,
-        requested: HashSet::new(),
-        visited: HashSet::new(),
-        counts: Arc::new(AtomicUsize::new(0)),
         last_crawl: Instant::now(),
     };
 
@@ -805,24 +759,25 @@ async fn crawl_handler(
             project_id,
             session_id.clone(),
             params.max_crawls,
+            params.max_chunks,
             Instant::now(),
         ),
     );
 
-    // Kick off the crawl AFTER registering the mapping
+    // Subscribe before publishing so the SSE stream can see the first crawl events.
+    let bus_rx = state.bus.subscribe();
+
     if let Err(e) = state.bus.publish(Event::new(
         "web-trigger",
         1,
         AppEvent::Crawler(CrawlerEvent::CrawlRequested {
             url: (*url).clone(),
             wait_selector: None,
+            max_chunks: Some(params.max_chunks),
         }),
     )) {
         warn!("Failed to publish initial crawl request: {}", e);
     }
-
-    // Subscribe to events AFTER publishing to ensure we receive all events
-    let bus_rx = state.bus.subscribe();
 
     // Track session progress for SSE completion
     let session_id_clone = session_id.clone();
@@ -871,7 +826,6 @@ async fn crawl_handler(
         )| async move {
             loop {
                 // Track progress
-                let total_chunks = pending_chunks.len() + embedded_chunks.len();
                 let embedded_count = embedded_chunks.len();
                 let requested_count = req.len();
 
@@ -898,7 +852,7 @@ async fn crawl_handler(
                     let mut urls_to_remove = Vec::new();
                     {
                         let map = state_clone.url_projects.read();
-                        for (url, (_, sid, _, _)) in map.iter() {
+                        for (url, (_, sid, _, _, _)) in map.iter() {
                             if sid == &session_id {
                                 urls_to_remove.push(url.clone());
                             }

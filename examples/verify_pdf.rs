@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         AppEvent::Crawler(CrawlerEvent::CrawlRequested {
             url: pdf_url.to_string(),
             wait_selector: None,
+            max_chunks: None,
         }),
     );
     bus.publish(crawl_event)?;

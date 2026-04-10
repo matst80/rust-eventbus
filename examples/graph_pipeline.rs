@@ -145,6 +145,7 @@ async fn main() -> Result<()> {
                                     AppEvent::Crawler(CrawlerEvent::CrawlRequested {
                                         url: normalized.clone(),
                                         wait_selector: None,
+                                        max_chunks: None,
                                     }),
                                 ));
                                 let _ = bus_for_extraction.publish(Event::new(
@@ -355,6 +356,7 @@ async fn main() -> Result<()> {
         AppEvent::Crawler(CrawlerEvent::CrawlRequested {
             url: start_url.to_string(),
             wait_selector: None,
+            max_chunks: None,
         }),
     ))?;
 

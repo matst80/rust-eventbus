@@ -155,7 +155,7 @@ impl CrawlerService {
             let bus_clone = Arc::clone(&self.bus);
             let rx_worker = Arc::clone(&shared_rx);
             let should_exclude_url = Arc::clone(&self.config.should_exclude_url);
-            let max_chunks = self.config.max_chunks;
+            let default_max_chunks = self.config.max_chunks;
 
             tokio::spawn(async move {
                 info!("Runner #{} started", i);
@@ -179,10 +179,12 @@ impl CrawlerService {
                         if let AppEvent::Crawler(CrawlerEvent::CrawlRequested {
                             url,
                             wait_selector,
+                            max_chunks,
                         }) = &event.payload
                         {
                             let url = url.clone();
                             let wait_selector = wait_selector.clone();
+                            let max_chunks = max_chunks.unwrap_or(default_max_chunks);
 
                             if should_exclude_url(&url) {
                                 info!("Runner #{} skipping excluded URL: {}", i, url);
