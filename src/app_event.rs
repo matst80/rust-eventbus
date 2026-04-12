@@ -26,7 +26,7 @@ pub enum GraphEvent {
     },
     RequestEmbedding {
         id: String,
-        content: String,
+        content: Option<String>,
     },
     ResetEmbeddingCache,
 }

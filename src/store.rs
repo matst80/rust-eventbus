@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 use async_trait::async_trait;
@@ -80,6 +81,48 @@ where
 }
 
 use tokio::sync::{mpsc, Mutex};
+
+/// An event store that does not persist events and only assigns global sequence numbers.
+#[derive(Debug, Default)]
+pub struct NoopEventStore {
+    next_global_seq: AtomicU64,
+}
+
+impl NoopEventStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next_global_seq: AtomicU64::new(1),
+        }
+    }
+}
+
+#[async_trait]
+impl<E> EventStore<E> for NoopEventStore
+where
+    E: EventPayload + 'static,
+{
+    async fn append(&self, mut events: Vec<Event<E>>) -> Result<Vec<Event<E>>, StoreError> {
+        for event in &mut events {
+            if event.global_sequence_num == 0 {
+                event.global_sequence_num = self.next_global_seq.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(events)
+    }
+
+    fn read_all_from(&self, _start_sequence: u64) -> BoxStream<'_, Result<Event<E>, StoreError>> {
+        futures::stream::empty().boxed()
+    }
+
+    async fn compact(&self, _rule: CompactionRule<E>) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    async fn truncate_before(&self, _min_seq: u64) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+}
 
 /// A simple file-based, append-only EventStore implementation using raw bincode binary sequences.
 #[derive(Clone)]

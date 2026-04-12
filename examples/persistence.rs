@@ -174,19 +174,36 @@ impl PersistenceService {
         Ok(())
     }
 
-    pub async fn update_embedding(
-        &self,
-        id: &str,
-        project_id: &str,
-        embedding: Vec<f32>,
-    ) -> Result<()> {
+    pub async fn update_embedding(&self, id: &str, embedding: Vec<f32>) -> Result<u64> {
         let vec = Vector::from(embedding);
-        sqlx::query("UPDATE bge_chunks SET embedding = $1 WHERE id = $2 AND project_id = $3")
+        let result = sqlx::query("UPDATE bge_chunks SET embedding = $1 WHERE id = $2")
             .bind(vec)
             .bind(id)
-            .bind(project_id)
             .execute(&*self.pool)
             .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn update_embeddings_batch(&self, embeddings: Vec<(String, Vec<f32>)>) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+
+        // We use a temporary table or a VALUES join to update multiple rows in one query.
+        // For simplicity and to avoid complex SQL for now, we'll use a transaction with multiple updates
+        // but it's still better than individual await calls in the main loop.
+        let mut tx = self.pool.begin().await?;
+
+        for (id, embedding) in embeddings {
+            let vec = Vector::from(embedding);
+            sqlx::query("UPDATE bge_chunks SET embedding = $1 WHERE id = $2")
+                .bind(vec)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 

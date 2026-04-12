@@ -185,11 +185,21 @@ impl MarkdownChunker {
 
                 let overlap = if is_blank_line { 0 } else { options.overlap };
                 let overlap_start = split_idx.saturating_sub(overlap);
-                let boundary = current_content
+                let mut boundary = current_content
                     .char_indices()
                     .map(|(i, _)| i)
                     .find(|&i| i >= overlap_start)
                     .unwrap_or(current_content.len());
+
+                // Ensure we always make progress to avoid infinite loops if overlap >= split_idx
+                if boundary == 0 && !current_content.is_empty() {
+                    boundary = current_content
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| i)
+                        .unwrap_or(current_content.len());
+                }
+
                 current_content = current_content[boundary..].to_string();
             }
         }
@@ -352,6 +362,22 @@ Content of section 1
         
         // This should not panic
         let chunks = MarkdownChunker::chunk(&text, &options);
+        assert!(!chunks.is_empty());
+    }
+
+    #[test]
+    fn test_infinite_loop_regression() {
+        // Test case where overlap >= split_idx
+        // If the only space is at index 5, and overlap is 10, boundary could be 0
+        let text = "aaaaa bbbbbbbbbbbbbbbbbbbb";
+        let options = ChunkerOptions {
+            max_size: 10,
+            min_size: 1,
+            overlap: 10, // Larger than max_size or split_idx
+        };
+        
+        // This should finish and not hang
+        let chunks = MarkdownChunker::chunk(text, &options);
         assert!(!chunks.is_empty());
     }
 }

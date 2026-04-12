@@ -14,7 +14,7 @@ use rust_eventbus::{
     app_event::{AppEvent, GraphEvent},
     crawler::{CrawlerConfig, CrawlerEvent, CrawlerService},
     embedding::{downloader::ModelDownloader, EmbeddingProcessor, OnnxEmbeddingService},
-    store::FileEventStore,
+    store::NoopEventStore,
     Event, EventBus,
 };
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,7 @@ struct AppConfig {
     db_max_connections: usize,
     bus_capacity: usize,
     crawler_concurrency: usize,
+    persistence_concurrency: usize,
 }
 
 impl Default for AppConfig {
@@ -102,6 +103,10 @@ impl Default for AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
+            persistence_concurrency: std::env::var("PERSISTENCE_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
         }
     }
 }
@@ -110,14 +115,37 @@ struct SessionState {
     last_crawl: Instant,
 }
 
+#[derive(Debug, Clone, Default)]
+struct CrawlProgressState {
+    requested_urls: HashSet<String>,
+    ingested_urls: HashSet<String>,
+    pending_chunks: HashSet<String>,
+    embedded_chunks: HashSet<String>,
+    failed_urls: HashSet<String>,
+    preview_chunks: Vec<PreviewChunk>,
+    last_activity: Option<Instant>,
+}
+
 struct AppState {
     bus: Arc<EventBus<AppEvent>>,
     embedding_service: Arc<OnnxEmbeddingService>,
     persistence: Arc<PersistenceService>,
+    embedding_queue: tokio::sync::mpsc::Sender<(String, String, u64)>,
     url_projects:
         Arc<parking_lot::RwLock<HashMap<String, (String, String, usize, usize, Instant)>>>,
+    chunk_sessions: Arc<parking_lot::RwLock<HashMap<String, String>>>,
+    progress: Arc<parking_lot::RwLock<HashMap<String, CrawlProgressState>>>,
     sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>>,
     shutdown_flag: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PreviewChunk {
+    id: String,
+    page_url: String,
+    page_title: String,
+    section: Option<String>,
+    preview: String,
 }
 
 #[tokio::main]
@@ -147,9 +175,7 @@ async fn main() -> Result<()> {
     info!("Connected to PostgreSQL");
 
     // 2. Event store
-    let temp_dir = tempfile::tempdir()?;
-    let store_path = temp_dir.path().join("events_web.log");
-    let event_store = Arc::new(FileEventStore::new(&store_path).await?);
+    let event_store = Arc::new(NoopEventStore::new());
 
     // 3. Event bus
     let bus = Arc::new(EventBus::<AppEvent>::new(config.bus_capacity));
@@ -160,6 +186,7 @@ async fn main() -> Result<()> {
         headless: true,
         max_chunks: config.max_chunks,
         shutdown_flag: Some(Arc::clone(&shutdown_flag_clone)),
+        user_data_dir: std::env::var("CHROME_USER_DATA_DIR").ok().map(Into::into),
         ..Default::default()
     };
     let crawler = Arc::new(CrawlerService::new(Arc::clone(&bus), crawler_config));
@@ -185,7 +212,7 @@ async fn main() -> Result<()> {
         Arc::clone(&event_store),
     )
     .await?;
-    embedding_processor.spawn().await;
+    let embedding_queue = embedding_processor.spawn().await;
 
     // 2. Persistence service
     let persistence = Arc::new(PersistenceService::new(
@@ -203,6 +230,12 @@ async fn main() -> Result<()> {
         parking_lot::RwLock<HashMap<String, (String, String, usize, usize, Instant)>>,
     > = Arc::new(parking_lot::RwLock::new(HashMap::new()));
     let url_projects_cleanup = Arc::clone(&url_projects);
+    let chunk_sessions: Arc<parking_lot::RwLock<HashMap<String, String>>> =
+        Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let chunk_sessions_cleanup = Arc::clone(&chunk_sessions);
+    let progress: Arc<parking_lot::RwLock<HashMap<String, CrawlProgressState>>> =
+        Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let progress_cleanup = Arc::clone(&progress);
 
     // Sessions map for per-session state isolation
     let sessions: Arc<parking_lot::RwLock<HashMap<String, SessionState>>> =
@@ -248,10 +281,17 @@ async fn main() -> Result<()> {
             if !session_to_remove.is_empty() {
                 let count = session_to_remove.len();
                 let mut map = sessions_cleanup.write();
-                for sid in session_to_remove {
-                    map.remove(&sid);
+                for sid in &session_to_remove {
+                    map.remove(sid);
+                    progress_cleanup.write().remove(sid);
                 }
                 info!("Cleaned up {} stale sessions", count);
+            }
+            if !session_to_remove.is_empty() {
+                let session_ids: HashSet<_> = session_to_remove.into_iter().collect();
+                chunk_sessions_cleanup
+                    .write()
+                    .retain(|_, sid| !session_ids.contains(sid));
             }
         }
     });
@@ -260,11 +300,14 @@ async fn main() -> Result<()> {
     let pipeline_bus = Arc::clone(&bus);
     let pipeline_persistence = Arc::clone(&persistence);
     let pipeline_projects = Arc::clone(&url_projects);
+    let pipeline_chunk_sessions = Arc::clone(&chunk_sessions);
+    let pipeline_progress = Arc::clone(&progress);
+    let pipeline_embedding_queue = embedding_queue.clone();
     let mut pipeline_rx = bus.subscribe();
     let config_clone = config.clone();
 
     // Semaphore for bounded concurrent batch operations
-    let batch_semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+    let batch_semaphore = Arc::new(tokio::sync::Semaphore::new(config.persistence_concurrency));
     let batch_semaphore_clone = Arc::clone(&batch_semaphore);
 
     tokio::spawn(async move {
@@ -287,6 +330,13 @@ async fn main() -> Result<()> {
                             }
                             None => continue,
                         };
+
+                    {
+                        let mut progress = pipeline_progress.write();
+                        let entry = progress.entry(session_id.clone()).or_default();
+                        entry.requested_urls.insert(url.clone());
+                        entry.last_activity = Some(Instant::now());
+                    }
 
                     let _should_reset = {
                         let mut last_write = last_crawl.write();
@@ -444,27 +494,20 @@ async fn main() -> Result<()> {
                         // Queue URL for crawling
                         urls_to_crawl.push(normalized.clone());
 
-                        // Publish edge for SSE
-                        if let Err(e) = pipeline_bus.publish(Event::new(
-                            url,
-                            event.sequence_num + 1,
-                            AppEvent::Graph(GraphEvent::EdgeAdded {
-                                from: url.clone(),
-                                to: normalized.clone(),
-                                relation: "links_to".into(),
-                                weight: 1.0,
-                            }),
-                        )) {
-                            warn!("Failed to publish edge event: {}", e);
-                        }
                     }
 
                     // Batch insert links
                     if !links_to_insert.is_empty() {
                         let persist = Arc::clone(&pipeline_persistence);
-                        let sem = Arc::clone(&batch_semaphore_clone);
+                        let permit = match Arc::clone(&batch_semaphore_clone).acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(e) => {
+                                tracing::error!("Failed to acquire link batch permit: {}", e);
+                                continue;
+                            }
+                        };
                         tokio::spawn(async move {
-                            let _permit = sem.acquire().await;
+                            let _permit = permit;
                             if let Err(e) = persist.insert_links_batch(links_to_insert).await {
                                 tracing::error!("Failed to insert links batch: {}", e);
                             }
@@ -501,67 +544,59 @@ async fn main() -> Result<()> {
                         .collect();
 
                     if !chunks_to_insert.is_empty() {
+                        {
+                            let mut progress = pipeline_progress.write();
+                            let entry = progress.entry(session_id.clone()).or_default();
+                            entry.ingested_urls.insert(url.clone());
+                            entry.last_activity = Some(Instant::now());
+                            for (i, chunk) in chunks.iter().enumerate() {
+                                let chunk_id = format!("{}#chunk-{}", url, i);
+                                entry.pending_chunks.insert(chunk_id.clone());
+                                pipeline_chunk_sessions
+                                    .write()
+                                    .insert(chunk_id.clone(), session_id.clone());
+                                entry.preview_chunks.push(PreviewChunk {
+                                    id: chunk_id,
+                                    page_url: url.clone(),
+                                    page_title: title.clone(),
+                                    section: (!chunk.headers.is_empty())
+                                        .then(|| chunk.headers.join(" > ")),
+                                    preview: preview_text(&chunk.content, 220),
+                                });
+                            }
+                            if entry.preview_chunks.len() > 3 {
+                                let drain_len = entry.preview_chunks.len() - 3;
+                                entry.preview_chunks.drain(0..drain_len);
+                            }
+                        }
+
                         let persist = Arc::clone(&pipeline_persistence);
-                        let sem = Arc::clone(&batch_semaphore_clone);
+                        let permit = match Arc::clone(&batch_semaphore_clone).acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(e) => {
+                                tracing::error!("Failed to acquire chunk batch permit: {}", e);
+                                continue;
+                            }
+                        };
                         tokio::spawn(async move {
-                            let _permit = sem.acquire().await;
+                            let _permit = permit;
                             if let Err(e) = persist.insert_chunks_batch(chunks_to_insert).await {
                                 tracing::error!("Failed to insert chunks batch: {}", e);
                             }
                         });
 
-                        // Publish NodeCreated events for SSE
                         for (i, chunk) in chunks.iter().enumerate() {
                             let chunk_id = format!("{}#chunk-{}", url, i);
-                            let section = if chunk.headers.is_empty() {
-                                None
-                            } else {
-                                Some(chunk.headers.join(" > "))
-                            };
-
-                            let mut metadata = HashMap::new();
-                            metadata.insert("type".into(), "chunk".into());
-                            metadata.insert("page_title".into(), title.clone());
-                            metadata.insert("content".into(), chunk.content.clone());
-                            if let Some(ref s) = section {
-                                metadata.insert("section".into(), s.clone());
-                            }
-
-                            if let Err(e) = pipeline_bus.publish(Event::new(
-                                &chunk_id,
-                                event.sequence_num + 2,
-                                AppEvent::Graph(GraphEvent::NodeCreated {
-                                    id: chunk_id.clone(),
-                                    metadata,
-                                }),
-                            )) {
-                                warn!("Failed to publish NodeCreated event: {}", e);
-                            }
-
-                            // Publish part_of edge for SSE
-                            if let Err(e) = pipeline_bus.publish(Event::new(
-                                &chunk_id,
-                                event.sequence_num + 3,
-                                AppEvent::Graph(GraphEvent::EdgeAdded {
-                                    from: chunk_id.clone(),
-                                    to: url.clone(),
-                                    relation: "part_of".into(),
-                                    weight: 1.0,
-                                }),
-                            )) {
-                                warn!("Failed to publish part_of edge: {}", e);
-                            }
-
                             // Request embedding (consumed by EmbeddingProcessor)
-                            if let Err(e) = pipeline_bus.publish(Event::new(
-                                &chunk_id,
-                                event.sequence_num + 4,
-                                AppEvent::Graph(GraphEvent::RequestEmbedding {
-                                    id: chunk_id.clone(),
-                                    content: format!("Page: {}\nChunk: {}", title, chunk.content),
-                                }),
-                            )) {
-                                warn!("Failed to publish RequestEmbedding: {}", e);
+                            if let Err(e) = pipeline_embedding_queue
+                                .send((
+                                    chunk_id.clone(),
+                                    format!("Page: {}\nChunk: {}", title, chunk.content),
+                                    event.sequence_num + 2,
+                                ))
+                                .await
+                            {
+                                warn!("Failed to queue embedding request: {}", e);
                             }
                         }
                     }
@@ -590,36 +625,48 @@ async fn main() -> Result<()> {
                     },
                 ) => {
                     tracing::debug!("Received embedding extracted for id: {}", id);
-                    let page_url = match id.rsplit_once("#chunk-") {
-                        Some((url, _)) => url,
-                        None => {
-                            tracing::warn!("Could not parse page_url from id: {}", id);
-                            continue;
+
+                    if let Some(session_id) = pipeline_chunk_sessions.read().get(id).cloned() {
+                        let mut progress = pipeline_progress.write();
+                        if let Some(entry) = progress.get_mut(&session_id) {
+                            entry.pending_chunks.remove(id);
+                            entry.embedded_chunks.insert(id.clone());
+                            entry.last_activity = Some(Instant::now());
                         }
-                    };
-                    let (project_id, _, _, _, _) =
-                        match pipeline_projects.read().get(page_url).cloned() {
-                            Some(data) => data,
-                            None => {
-                                tracing::warn!("No project_id found for page_url: {}", page_url);
-                                continue;
-                            }
-                        };
-                    tracing::debug!("Updating embedding for id: {} project: {}", id, project_id);
+                    }
 
                     // Batch update embedding
                     let persist = Arc::clone(&pipeline_persistence);
-                    let sem = Arc::clone(&batch_semaphore_clone);
                     let id_clone = id.clone();
                     let embed_clone = embedding.clone();
+                    let permit = match Arc::clone(&batch_semaphore_clone).acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(e) => {
+                            tracing::error!("Failed to acquire embedding update permit: {}", e);
+                            continue;
+                        }
+                    };
                     tokio::spawn(async move {
-                        let _permit = sem.acquire().await;
-                        if let Err(e) =
-                            persist.update_embedding(&id_clone, &project_id, embed_clone).await
-                        {
-                            tracing::error!("Failed to update embedding: {}", e);
+                        let _permit = permit;
+                        match persist.update_embedding(&id_clone, embed_clone).await {
+                            Ok(0) => {
+                                tracing::warn!("No chunk row found to update embedding for id: {}", id_clone);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!("Failed to update embedding: {}", e);
+                            }
                         }
                     });
+                }
+                AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, .. }) => {
+                    if let Some((_, session_id, _, _, _)) = pipeline_projects.read().get(url).cloned()
+                    {
+                        let mut progress = pipeline_progress.write();
+                        let entry = progress.entry(session_id).or_default();
+                        entry.failed_urls.insert(url.clone());
+                        entry.last_activity = Some(Instant::now());
+                    }
                 }
 
                 _ => {}
@@ -632,7 +679,10 @@ async fn main() -> Result<()> {
         bus,
         embedding_service,
         persistence,
+        embedding_queue,
         url_projects,
+        chunk_sessions,
+        progress,
         sessions,
         shutdown_flag: Arc::clone(&shutdown_flag),
     });
@@ -675,6 +725,7 @@ fn make_progress(
     ing: &HashSet<String>,
     req: &HashSet<String>,
     failed: &HashSet<String>,
+    previews: &[PreviewChunk],
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "progress",
@@ -683,8 +734,23 @@ fn make_progress(
         "embedded_nodes": embedded.len(),
         "ingested_urls": ing.len(),
         "requested_urls": req.len(),
-        "failed_urls": failed.len()
+        "failed_urls": failed.len(),
+        "preview_chunks": previews
     })
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars + 1));
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count == max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -750,6 +816,17 @@ async fn crawl_handler(
         .sessions
         .write()
         .insert(session_id.clone(), session_state);
+    state
+        .progress
+        .write()
+        .insert(
+            session_id.clone(),
+            CrawlProgressState {
+                requested_urls: HashSet::from([(*url).clone()]),
+                last_activity: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
 
     state.url_projects.write().insert(
         (*url).clone(),
@@ -785,6 +862,7 @@ async fn crawl_handler(
     let pending_chunks = HashSet::new();
     let embedded_chunks = HashSet::new();
     let failed_urls = HashSet::new();
+    let preview_chunks = Vec::new();
     let last_activity = std::time::Instant::now();
     let idle_count = 0;
     let state_clone = Arc::clone(&state);
@@ -803,6 +881,7 @@ async fn crawl_handler(
             pending_chunks,
             embedded_chunks,
             failed_urls,
+            preview_chunks,
             last_activity,
             idle_count,
             state_clone,
@@ -819,6 +898,7 @@ async fn crawl_handler(
             mut pending_chunks,
             mut embedded_chunks,
             mut failed,
+            mut previews,
             mut last,
             mut idle_count,
             state_clone,
@@ -832,18 +912,37 @@ async fn crawl_handler(
                     return None;
                 }
 
+                if let Some(current) = state_clone.progress.read().get(&session_id).cloned() {
+                    req = current.requested_urls;
+                    ing = current.ingested_urls;
+                    pending_chunks = current.pending_chunks;
+                    embedded_chunks = current.embedded_chunks;
+                    failed = current.failed_urls;
+                    previews = current.preview_chunks;
+                    if let Some(activity) = current.last_activity {
+                        if activity > last {
+                            last = activity;
+                            idle_count = 0;
+                        }
+                    }
+                }
+
                 // Track progress
                 let embedded_count = embedded_chunks.len();
                 let requested_count = req.len();
 
                 // Only check for completion after we've had at least one activity
-                // and no pending chunks remain
-                // Complete if: reached max_crawls OR (has progress, no pending chunks, and idle)
+                // and no pending chunks remain.
+                // Complete only when all requested URLs have been processed (ingested or failed),
+                // or when we've processed up to the max crawl limit.
                 let has_started = !ing.is_empty() || embedded_count > 0;
-                let total_processed = requested_count + failed.len();
-                let reached_max = total_processed >= max_crawls;
-                let is_complete =
-                    reached_max || (pending_chunks.is_empty() && has_started && idle_count >= 2);
+                let processed_urls = ing.len() + failed.len();
+                let reached_max = processed_urls >= max_crawls;
+                let all_requested_processed = processed_urls >= requested_count;
+                let is_complete = has_started
+                    && pending_chunks.is_empty()
+                    && idle_count >= 2
+                    && (reached_max || all_requested_processed);
 
                 // After completion is sent, end the stream
                 if is_complete && idle_count >= 3 {
@@ -871,6 +970,11 @@ async fn crawl_handler(
                             map.remove(&url);
                         }
                     }
+                    state_clone.progress.write().remove(&session_id);
+                    state_clone
+                        .chunk_sessions
+                        .write()
+                        .retain(|_, sid| sid != &session_id);
                     info!("Cleaned up session: {}", session_id);
                     return None;
                 }
@@ -889,6 +993,7 @@ async fn crawl_handler(
                         &ing,
                         &req,
                         &failed,
+                        &previews,
                     );
                     return Some((
                         Ok(SseEvent::default().data(progress_json.to_string())),
@@ -902,6 +1007,7 @@ async fn crawl_handler(
                             pending_chunks,
                             embedded_chunks,
                             failed,
+                            previews,
                             last,
                             idle_count,
                             state_clone,
@@ -914,7 +1020,12 @@ async fn crawl_handler(
                 // Timeout check using configurable timeout
                 // Only timeout if we've actually had some activity and been waiting too long
                 let has_progress = !ing.is_empty() || embedded_count > 0;
-                if has_progress && last.elapsed().as_secs() > config_for_sse.crawl_timeout_secs {
+                let timeout_secs = if pending_chunks.is_empty() {
+                    config_for_sse.crawl_timeout_secs
+                } else {
+                    config_for_sse.crawl_timeout_secs.saturating_mul(10)
+                };
+                if has_progress && last.elapsed().as_secs() > timeout_secs {
                     info!(
                         "Crawl session timed out for: {} (ing: {}, embedded: {})",
                         url_arc,
@@ -928,6 +1039,7 @@ async fn crawl_handler(
                         &ing,
                         &req,
                         &failed,
+                        &previews,
                     );
                     return Some((
                         Ok(SseEvent::default().data(progress_json.to_string())),
@@ -941,6 +1053,7 @@ async fn crawl_handler(
                             pending_chunks,
                             embedded_chunks,
                             failed,
+                            previews,
                             last,
                             idle_count,
                             state_clone,
@@ -968,7 +1081,7 @@ async fn crawl_handler(
                                 }
                             }
                         }
-                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, chunks, .. }) => {
+                        AppEvent::Crawler(CrawlerEvent::PageIngested { url, title, chunks, .. }) => {
                             if req.contains(&url) {
                                 if ing.insert(url.clone()) {
                                     last = std::time::Instant::now();
@@ -981,6 +1094,21 @@ async fn crawl_handler(
                                         pending_chunks.insert(chunk_id);
                                     }
 
+                                    for (i, chunk) in chunks.iter().take(3).enumerate() {
+                                        previews.push(PreviewChunk {
+                                            id: format!("{}#chunk-{}", url, i),
+                                            page_url: url.clone(),
+                                            page_title: title.clone(),
+                                            section: (!chunk.headers.is_empty())
+                                                .then(|| chunk.headers.join(" > ")),
+                                            preview: preview_text(&chunk.content, 220),
+                                        });
+                                    }
+                                    if previews.len() > 3 {
+                                        let drain_len = previews.len() - 3;
+                                        previews.drain(0..drain_len);
+                                    }
+
                                     // Send progress update
                                     let progress_json = make_progress(
                                         &session_id,
@@ -989,6 +1117,7 @@ async fn crawl_handler(
                                         &ing,
                                         &req,
                                         &failed,
+                                        &previews,
                                     );
                                     return Some((
                                         Ok(SseEvent::default().data(progress_json.to_string())),
@@ -1002,53 +1131,15 @@ async fn crawl_handler(
                                             pending_chunks,
                                             embedded_chunks,
                                             failed,
+                                            previews,
                                             last,
                                             idle_count,
                                             state_clone,
                                             max_crawls,
-                                shutdown_flag,
+                                            shutdown_flag,
                                         ),
                                     ));
                                 }
-                            }
-                        }
-                        AppEvent::Graph(GraphEvent::NodeCreated { id: _, .. }) => {
-                            last = std::time::Instant::now();
-                            idle_count = 0;
-                        }
-                        AppEvent::Graph(GraphEvent::EdgeAdded { from, to, .. }) => {
-                            if from.contains(&*url_arc) || to.contains(&*url_arc) {
-                                last = std::time::Instant::now();
-                                idle_count = 0;
-
-                                // Send progress update
-                                let progress_json = make_progress(
-                                    &session_id,
-                                    &pending_chunks,
-                                    &embedded_chunks,
-                                    &ing,
-                                    &req,
-                                    &failed,
-                                );
-                                return Some((
-                                    Ok(SseEvent::default().data(progress_json.to_string())),
-                                    (
-                                        rx,
-                                        url_arc,
-                                        session_id,
-                                        domain,
-                                        req,
-                                        ing,
-                                        pending_chunks,
-                                        embedded_chunks,
-                                        failed,
-                                        last,
-                                        idle_count,
-                                        state_clone,
-                                        max_crawls,
-                                        shutdown_flag,
-                                    ),
-                                ));
                             }
                         }
                         AppEvent::Embedding(
@@ -1070,6 +1161,7 @@ async fn crawl_handler(
                                     &ing,
                                     &req,
                                     &failed,
+                                    &previews,
                                 );
                                 return Some((
                                     Ok(SseEvent::default().data(progress_json.to_string())),
@@ -1083,21 +1175,14 @@ async fn crawl_handler(
                                         pending_chunks,
                                         embedded_chunks,
                                         failed,
+                                        previews,
                                         last,
                                         idle_count,
                                         state_clone,
                                         max_crawls,
-                                shutdown_flag,
+                                        shutdown_flag,
                                     ),
                                 ));
-                            }
-                        }
-                        AppEvent::Crawler(CrawlerEvent::CrawlFailed { url, .. }) => {
-                            if req.contains(&url) {
-                                if failed.insert(url.clone()) {
-                                    last = std::time::Instant::now();
-                                    idle_count = 0;
-                                }
                             }
                         }
                         _ => {}

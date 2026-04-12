@@ -87,7 +87,11 @@ impl CrawlerService {
                 width: 1920,
                 height: 1080,
                 ..Default::default()
-            });
+            })
+            .arg("--disable-crashpad")
+            .arg("--disable-dev-shm-usage")
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check");
 
         if !self.config.headless {
             builder = builder.with_head();
@@ -296,7 +300,7 @@ impl CrawlerService {
     /// Fetches the page, immediately converts the HTML to links + chunks in a blocking thread,
     /// and drops the raw HTML before returning. This ensures multi-megabyte Chrome DOM strings
     /// never enter the event-bus ring buffer.
-    async fn process_crawl(
+    pub async fn process_crawl(
         page: &Page,
         url: &str,
         wait_selector: Option<String>,

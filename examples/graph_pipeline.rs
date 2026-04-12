@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
                     event.sequence_num + 5,
                     AppEvent::Graph(GraphEvent::RequestEmbedding {
                         id: url.clone(),
-                        content: page_embedding_content,
+                        content: Some(page_embedding_content),
                     }),
                 ));
 
@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
                                 event.sequence_num + 12,
                                 AppEvent::Graph(GraphEvent::RequestEmbedding {
                                     id: section_id.clone(),
-                                    content: section_embedding_content,
+                                    content: Some(section_embedding_content),
                                 }),
                             ));
 
@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
                         event.sequence_num + 12 + (i * 20) as u64,
                         AppEvent::Graph(GraphEvent::RequestEmbedding {
                             id: chunk_id.clone(),
-                            content: contextual_content,
+                            content: Some(contextual_content),
                         }),
                     ));
 
