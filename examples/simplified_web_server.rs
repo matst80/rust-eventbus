@@ -35,9 +35,11 @@ mod persistence;
 use persistence::PersistenceService;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CrawlRequest {
     url: String,
     project_id: String,
+    source_id: String,
     #[serde(default = "default_max_crawls")]
     max_crawls: usize,
     #[serde(default = "default_max_chunks")]
@@ -52,9 +54,11 @@ fn default_max_chunks() -> usize {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchRequest {
     query: String,
     project_id: String,
+    source_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +200,7 @@ async fn search_handler(
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Persistence disabled").into_response();
     };
 
-    match persistence.search(&payload.query, &payload.project_id).await {
+    match persistence.search(&payload.query, &payload.project_id, payload.source_id.as_deref()).await {
         Ok(results) => Json(results).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -226,6 +230,7 @@ async fn perform_crawl(
 ) -> Result<()> {
     let start_url = params.url;
     let project_id = params.project_id;
+    let source_id = params.source_id;
     let max_crawls = params.max_crawls;
     let max_chunks = params.max_chunks;
 
@@ -263,7 +268,9 @@ async fn perform_crawl(
                 processed_count += 1;
 
                 if let Some(ref p) = state.persistence {
-                    let _ = p.upsert_page(&current_url, &project_id, &title).await;
+                    if let Err(e) = p.upsert_page(&current_url, &project_id, &source_id, &title).await {
+                        error!("Failed to upsert page {}: {:?}", current_url, e);
+                    }
                     
                     let mut chunk_batch = Vec::new();
                     let mut embedding_texts = Vec::new();
@@ -282,6 +289,7 @@ async fn perform_crawl(
                         chunk_batch.push((
                             chunk_id.clone(),
                             project_id.clone(),
+                            source_id.clone(),
                             current_url.clone(),
                             i as i32,
                             section,
@@ -292,22 +300,30 @@ async fn perform_crawl(
                     }
 
                     if !chunk_batch.is_empty() {
-                        let _ = p.insert_chunks_batch(chunk_batch).await;
-                        
-                        // Batch embed all chunks for this page
-                        let emb_service = Arc::clone(&state.embedding_service);
-                        match tokio::task::spawn_blocking(move || {
-                            emb_service.embed_batch(&embedding_texts)
-                        }).await {
-                            Ok(Ok(embeddings)) => {
-                                let mut embedding_batch = Vec::new();
-                                for (id, emb) in chunk_ids.into_iter().zip(embeddings.into_iter()) {
-                                    embedding_batch.push((id, emb));
+                        if let Err(e) = p.insert_chunks_batch(chunk_batch).await {
+                            error!("Failed to insert chunks for {}: {:?}", current_url, e);
+                        } else {
+                            // Only try to embed if we successfully inserted the chunks
+                            let emb_service = Arc::clone(&state.embedding_service);
+                            let project_id_clone = project_id.clone();
+                            let source_id_clone = source_id.clone();
+                            let p_clone = Arc::clone(p);
+
+                            match tokio::task::spawn_blocking(move || {
+                                emb_service.embed_batch(&embedding_texts)
+                            }).await {
+                                Ok(Ok(embeddings)) => {
+                                    let mut embedding_batch = Vec::new();
+                                    for (id, emb) in chunk_ids.into_iter().zip(embeddings.into_iter()) {
+                                        embedding_batch.push((id, emb));
+                                    }
+                                    if let Err(e) = p_clone.update_embeddings_batch(&project_id_clone, &source_id_clone, embedding_batch).await {
+                                        error!("Failed to update embeddings for {}: {:?}", current_url, e);
+                                    }
                                 }
-                                let _ = p.update_embeddings_batch(embedding_batch).await;
+                                Ok(Err(e)) => error!("Batch embedding failed: {:?}", e),
+                                Err(e) => error!("Blocking task for batch embedding panicked: {:?}", e),
                             }
-                            Ok(Err(e)) => error!("Batch embedding failed: {:?}", e),
-                            Err(e) => error!("Blocking task for batch embedding panicked: {:?}", e),
                         }
                     }
                 }
